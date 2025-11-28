@@ -1,0 +1,33 @@
+# Local Terraform state
+*.tfstate
+*.tfstate.*
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Terraform plan output
+*.tfplan
+
+# Module and provider plugins (Terraform 0.13+는 자동 관리되지만 혹시 몰라 추가)
+.terraform/
+.terraform.lock.hcl
+
+# Sensitive variable files
+terraform.tfvars
+*.tfvars
+*.tfvars.json
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Local environment variable files
+.env
+*.env
+
+# Editor/OS files
+.DS_Store
+Thumbs.db
