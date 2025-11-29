@@ -360,6 +360,8 @@ resource "aws_vpc_endpoint" "s3" {
   
   route_table_ids = [
     aws_route_table.vpc1_ecs_frontend_rt_aza.id,
+    aws_route_table.vpc1_ecs_frontend_rt_azc.id,
+    aws_route_table.vpc1_ecs_backend_rt_aza.id,
     aws_route_table.vpc1_ecs_backend_rt_azc.id
   ]
 
@@ -659,8 +661,8 @@ resource "aws_security_group" "ecs_backend_sg" {
 
   ingress {
     description     = "App Port from Internal ALB"
-    from_port       = 8080
-    to_port         = 8080
+    from_port       = 8000
+    to_port         = 8000d
     protocol        = "tcp"
     security_groups = [aws_security_group.internal_alb_sg.id]
   }
@@ -721,7 +723,7 @@ resource "aws_security_group" "db_sg" {
 # Public ALB Target Group (Frontend)
 resource "aws_lb_target_group" "frontend_tg" {
   name        = "ecs-frontend-tg"
-  port        = 3000
+  port        = 80
   protocol    = "HTTP"
   vpc_id      = aws_vpc.vpc1.id
   target_type = "ip"
@@ -744,7 +746,7 @@ resource "aws_lb_target_group" "frontend_tg" {
 # Internal ALB Target Group (Backend)
 resource "aws_lb_target_group" "backend_tg" {
   name        = "ecs-backend-tg"
-  port        = 8080
+  port        = 8000
   protocol    = "HTTP"
   vpc_id      = aws_vpc.vpc1.id
   target_type = "ip"
@@ -755,7 +757,7 @@ resource "aws_lb_target_group" "backend_tg" {
     unhealthy_threshold = 2
     timeout             = 5
     interval            = 30
-    path                = "/api/health"
+    path                = "/health"
     matcher             = "200"
   }
 
@@ -796,61 +798,61 @@ resource "aws_lb_listener" "internal_alb_listener" {
 # ============================================
 # ECR 리포지토리
 # ============================================
-resource "aws_ecr_repository" "frontend" {
-  name                 = "frontend-app"
-  image_tag_mutability = "MUTABLE"
+# resource "aws_ecr_repository" "frontend" {
+#   name                 = "frontend-app"
+#   image_tag_mutability = "MUTABLE"
 
-  image_scanning_configuration {
-    scan_on_push = true  # 보안 취약점 자동 스캔
-  }
+#   image_scanning_configuration {
+#     scan_on_push = true  # 보안 취약점 자동 스캔
+#   }
 
-  encryption_configuration {
-    encryption_type = "AES256"
-  }
+#   encryption_configuration {
+#     encryption_type = "AES256"
+#   }
 
-  tags = {
-    Name        = "frontend-repository"
-    Environment = "production"
-  }
-}
+#   tags = {
+#     Name        = "frontend-repository"
+#     Environment = "production"
+#   }
+# }
 
-resource "aws_ecr_repository" "backend" {
-  name                 = "backend-app"
-  image_tag_mutability = "MUTABLE"
+# resource "aws_ecr_repository" "backend" {
+#   name                 = "backend-app"
+#   image_tag_mutability = "MUTABLE"
 
-  image_scanning_configuration {
-    scan_on_push = true
-  }
+#   image_scanning_configuration {
+#     scan_on_push = true
+#   }
 
-  encryption_configuration {
-    encryption_type = "AES256"
-  }
+#   encryption_configuration {
+#     encryption_type = "AES256"
+#   }
 
-  tags = {
-    Name        = "backend-repository"
-    Environment = "production"
-  }
-}
+#   tags = {
+#     Name        = "backend-repository"
+#     Environment = "production"
+#   }
+# }
 
 # ECR 수명주기 정책 (오래된 이미지 자동 삭제)
-resource "aws_ecr_lifecycle_policy" "frontend_policy" {
-  repository = aws_ecr_repository.frontend.name
+# resource "aws_ecr_lifecycle_policy" "frontend_policy" {
+#   repository = aws_ecr_repository.frontend.name
 
-  policy = jsonencode({
-    rules = [{
-      rulePriority = 1
-      description  = "Keep last 15 images"  #15장으로 수정하기
-      selection = {
-        tagStatus     = "any"
-        countType     = "imageCountMoreThan"
-        countNumber   = 15
-      }
-      action = {
-        type = "expire"
-      }
-    }]
-  })
-}
+#   policy = jsonencode({
+#     rules = [{
+#       rulePriority = 1
+#       description  = "Keep last 15 images"  #15장으로 수정하기
+#       selection = {
+#         tagStatus     = "any"
+#         countType     = "imageCountMoreThan"
+#         countNumber   = 15
+#       }
+#       action = {
+#         type = "expire"
+#       }
+#     }]
+#   })
+# }
 
 # ============================================
 # CloudWatch 로그 그룹
@@ -914,10 +916,10 @@ resource "aws_iam_role" "ecs_task_role" {
 }
 
 # ============================================
-# ECS 클러스터
+# 프론트엔드 ECS 클러스터
 # ============================================
-resource "aws_ecs_cluster" "main" {
-  name = "web-app-cluster"
+resource "aws_ecs_cluster" "frontend" {
+  name = "frontend-cluster"
 
   setting {
     name  = "containerInsights"
@@ -928,16 +930,40 @@ resource "aws_ecs_cluster" "main" {
     execute_command_configuration {
       logging = "OVERRIDE"
       log_configuration {
-        cloud_watch_log_group_name = "/ecs/exec"
+        cloud_watch_log_group_name = "/ecs/exec/frontend"
       }
     }
   }
 
   tags = {
-    Name = "main-cluster"
+    Name = "frontend-cluster"
   }
 }
 
+# ============================================
+# 백엔드 ECS 클러스터
+# ============================================
+resource "aws_ecs_cluster" "backend" {
+  name = "backend-cluster"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"  # 모니터링 강화
+  }
+
+  configuration {
+    execute_command_configuration {
+      logging = "OVERRIDE"
+      log_configuration {
+        cloud_watch_log_group_name = "/ecs/exec/backend"
+      }
+    }
+  }
+
+  tags = {
+    Name = "backend-cluster"
+  }
+}
 
 # ============================================
 # 프론트엔드 ECS Task Definition
@@ -952,33 +978,14 @@ resource "aws_ecs_task_definition" "frontend" {
   task_role_arn            = aws_iam_role.ecs_task_role.arn
 
   container_definitions = jsonencode([{
-    name      = "frontend"
-    image     = "${aws_ecr_repository.frontend.repository_url}:latest"   #repository_url 설정해주기
+    name      = "frontend-container" #컨테이너 이름 
+    image     = "246737816332.dkr.ecr.ap-northeast-2.amazonaws.com/frontend-app:latest"   #repository_url 설정해주기
     essential = true
 
     portMappings = [{
-      containerPort = 3000
+      containerPort = 80
       protocol      = "tcp"
     }]
-
-    environment = [
-      {
-        name  = "NODE_ENV"
-        value = "production"
-      },
-      {
-        name  = "vpc1-internal-alb"  # 이 부분을 실제 백엔드 ALB 리소스 이름으로 변경
-        value = "http://${aws_lb.internal_alb.dns_name}"  # 백엔드 ALB 주소  실제 이름 확인 필요
-      }
-    ]
-
-    healthCheck = {
-      command     = ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"]
-      interval    = 30
-      timeout     = 5
-      retries     = 3
-      startPeriod = 60
-    }
 
     logConfiguration = {
       logDriver = "awslogs"
@@ -1008,41 +1015,41 @@ resource "aws_ecs_task_definition" "backend" {
   task_role_arn            = aws_iam_role.ecs_task_role.arn
 
   container_definitions = jsonencode([{
-    name      = "backend"
-    image     = "${aws_ecr_repository.backend.repository_url}:latest"
+    name      = "backend-container" #컨테이너 이름 
+    image     = "246737816332.dkr.ecr.ap-northeast-2.amazonaws.com/backend-app:latest"
     essential = true
 
     portMappings = [{
-      containerPort = 8080
+      containerPort = 8000
       protocol      = "tcp"
     }]
 
-    # environment = [
-    #   {
-    #     name  = "SERVER_PORT"
-    #     value = "8080"
-    #   },
-    #   {
-    #     name  = "DATABASE_HOST"  # RDS가 있다면 실제 엔드포인트로, 없다면 일단 제거
-    #     value = "your-rds-endpoint"  # RDS 엔드포인트
-    #   }
-    # ]
-
-    # # 민감한 정보는 Secrets Manager 사용 (추가 점수!)  # secrets key 없으면 이 부분 주석 처리
-    # secrets = [
-    #   {
-    #     name      = "DATABASE_PASSWORD"
-    #     valueFrom = "arn:aws:secretsmanager:region:account:secret:db-password"
-    #   }
-    # ]
-
-    healthCheck = {
-      command     = ["CMD-SHELL", "curl -f http://localhost:8080/actuator/health || exit 1"]
-      interval    = 30
-      timeout     = 5
-      retries     = 3
-      startPeriod = 60
-    }
+    environment = [
+      {
+        name  = "CLOUD_API_KEY"
+        value = "222768776744816"
+      },
+      {
+        name  = "CLOUD_API_SECRET"
+        value = "1kj1qRyaxurxfH3vM6I3TJImlgQ"
+      },
+      {
+        name  = "CLOUD_NAME"  
+        value = "dqqhihcfa" 
+      },
+            {
+        name  = "DB_PASSWORD"  
+        value = "DB 비밀번호" 
+      },
+            {
+        name  = "DB_URL"  
+        value = "jdbc:mysql://DB명 입력:3306/social_network?useSSL=false&createDatabaseIfNotExist=true&serverTimezone=UTC" 
+      },
+            {
+        name  = "DB_USERNAME"  
+        value = "admin" 
+      }
+    ]
 
     logConfiguration = {
       logDriver = "awslogs"
@@ -1060,133 +1067,138 @@ resource "aws_ecs_task_definition" "backend" {
 }
 
 
-# # ============================================
-# # 프론트엔드 ECS Service
-# # ============================================
-# resource "aws_ecs_service" "frontend" {
-#   name            = "frontend-service"
-#   cluster         = aws_ecs_cluster.main.id
-#   task_definition = aws_ecs_task_definition.frontend.arn
-#   desired_count   = 2  # 가용성을 위해 최소 2개
-#   launch_type     = "FARGATE"
+# ============================================
+# 프론트엔드 ECS Service
+# ============================================
+resource "aws_ecs_service" "frontend" {
+  name            = "frontend-service"
+  cluster         = aws_ecs_cluster.frontend.id
+  task_definition = aws_ecs_task_definition.frontend.arn
+  desired_count   = 1    #빠른 구동을위해 임시로 1로 설정 
+  launch_type     = "FARGATE"
 
-#   network_configuration {
-#     subnets          = var.private_subnet_ids  # Private 서브넷 권장
-#     security_groups  = [aws_security_group.frontend_ecs.id]
-#     assign_public_ip = false
-#   }
+  network_configuration {
+    subnets = [
+      aws_subnet.vpc1_ecs_frontend_aza.id,
+      aws_subnet.vpc1_ecs_frontend_azc.id,
+    ]
 
-#   load_balancer {
-#     target_group_arn = aws_lb_target_group.frontend.arn
-#     container_name   = "frontend"
-#     container_port   = 3000
-#   }
+    security_groups  = [aws_security_group.ecs_frontend_sg.id]
+    assign_public_ip = false
+  }
 
-#   deployment_configuration {
-#     maximum_percent         = 200
-#     minimum_healthy_percent = 100
-#   }
+  load_balancer {
+    target_group_arn = aws_lb_target_group.frontend_tg.arn
+    container_name   = "frontend-container"   # ← task_definition 안 name 과 동일해야 함
+    container_port   = 80           # nginx 가 LISTEN 하는 포트
+  }
 
-#   # 롤링 업데이트 설정
-#   deployment_circuit_breaker {
-#     enable   = true
-#     rollback = true
-#   }
+  deployment_maximum_percent         = 200
+  deployment_minimum_healthy_percent = 100
 
-#   depends_on = [aws_lb_listener.frontend]
-# }
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
 
-# # ============================================
-# # 백엔드 ECS Service
-# # ============================================
-# resource "aws_ecs_service" "backend" {
-#   name            = "backend-service"
-#   cluster         = aws_ecs_cluster.main.id
-#   task_definition = aws_ecs_task_definition.backend.arn
-#   desired_count   = 2
-#   launch_type     = "FARGATE"
+  depends_on = [aws_lb_listener.public_alb_listener]
+}
 
-#   network_configuration {
-#     subnets          = var.private_subnet_ids
-#     security_groups  = [aws_security_group.backend_ecs.id]
-#     assign_public_ip = false
-#   }
 
-#   load_balancer {
-#     target_group_arn = aws_lb_target_group.backend.arn
-#     container_name   = "backend"
-#     container_port   = 8080
-#   }
+# ============================================
+# 백엔드 ECS Service
+# ============================================
+resource "aws_ecs_service" "backend" {
+  name            = "backend-service"
+  cluster         = aws_ecs_cluster.backend.id
+  task_definition = aws_ecs_task_definition.backend.arn
+  desired_count   = 1        #빠른 구동을위해 임시로 1로 설정 
+  launch_type     = "FARGATE"
 
-#   deployment_configuration {
-#     maximum_percent         = 200
-#     minimum_healthy_percent = 100
-#   }
+  network_configuration {
+      subnets = [
+      aws_subnet.vpc1_ecs_backend_aza.id,
+      aws_subnet.vpc1_ecs_backend_azc.id,
+    ]
+    security_groups  = [aws_security_group.ecs_backend_sg.id]
+    assign_public_ip = false
+  }
 
-#   deployment_circuit_breaker {
-#     enable   = true
-#     rollback = true
-#   }
+  load_balancer {
+    target_group_arn = aws_lb_target_group.backend_tg.arn
+    container_name   = "backend-container"
+    container_port   = 8000
+  }
 
-#   depends_on = [aws_lb_listener.backend]
-# }
+  deployment_maximum_percent         = 200
+  deployment_minimum_healthy_percent = 100
 
-# # ============================================
-# # Auto Scaling
-# # ============================================
-# resource "aws_appautoscaling_target" "frontend" {
-#   max_capacity       = 10
-#   min_capacity       = 2
-#   resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.frontend.name}"
-#   scalable_dimension = "ecs:service:DesiredCount"
-#   service_namespace  = "ecs"
-# }
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
 
-# resource "aws_appautoscaling_policy" "frontend_cpu" {
-#   name               = "frontend-cpu-scaling"
-#   policy_type        = "TargetTrackingScaling"
-#   resource_id        = aws_appautoscaling_target.frontend.resource_id
-#   scalable_dimension = aws_appautoscaling_target.frontend.scalable_dimension
-#   service_namespace  = aws_appautoscaling_target.frontend.service_namespace
+  depends_on = [aws_lb_listener.internal_alb_listener]
+}
 
-#   target_tracking_scaling_policy_configuration {
-#     target_value = 70.0
+# ============================================
+# Auto Scaling
+# ============================================
+#프론트엔드
+resource "aws_appautoscaling_target" "frontend" {
+  max_capacity       = 4
+  min_capacity       = 1
+  resource_id        = "service/${aws_ecs_cluster.frontend.name}/${aws_ecs_service.frontend.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
 
-#     predefined_metric_specification {
-#       predefined_metric_type = "ECSServiceAverageCPUUtilization"
-#     }
+resource "aws_appautoscaling_policy" "frontend_cpu" {
+  name               = "frontend-cpu-scaling"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.frontend.resource_id
+  scalable_dimension = aws_appautoscaling_target.frontend.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.frontend.service_namespace
 
-#     scale_in_cooldown  = 300
-#     scale_out_cooldown = 60
-#   }
-# }
+  target_tracking_scaling_policy_configuration {
+    target_value = 70.0
 
-# resource "aws_appautoscaling_target" "backend" {
-#   max_capacity       = 10
-#   min_capacity       = 2
-#   resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.backend.name}"
-#   scalable_dimension = "ecs:service:DesiredCount"
-#   service_namespace  = "ecs"
-# }
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
 
-# resource "aws_appautoscaling_policy" "backend_cpu" {
-#   name               = "backend-cpu-scaling"
-#   policy_type        = "TargetTrackingScaling"
-#   resource_id        = aws_appautoscaling_target.backend.resource_id
-#   scalable_dimension = aws_appautoscaling_target.backend.scalable_dimension
-#   service_namespace  = aws_appautoscaling_target.backend.service_namespace
+    scale_in_cooldown  = 300
+    scale_out_cooldown = 60
+  }
+}
 
-#   target_tracking_scaling_policy_configuration {
-#     target_value = 70.0
+#백엔드
+resource "aws_appautoscaling_target" "backend" {
+  max_capacity       = 4
+  min_capacity       = 1
+  resource_id        = "service/${aws_ecs_cluster.backend.name}/${aws_ecs_service.backend.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
 
-#     predefined_metric_specification {
-#       predefined_metric_type = "ECSServiceAverageCPUUtilization"
-#     }
+resource "aws_appautoscaling_policy" "backend_cpu" {
+  name               = "backend-cpu-scaling"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.backend.resource_id
+  scalable_dimension = aws_appautoscaling_target.backend.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.backend.service_namespace
 
-#     scale_in_cooldown  = 300
-#     scale_out_cooldown = 60
-#   }
-# }
+  target_tracking_scaling_policy_configuration {
+    target_value = 70.0
+
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+
+    scale_in_cooldown  = 300
+    scale_out_cooldown = 60
+  }
+}
 
 # # ============================================
 # # CloudWatch Alarms (모니터링)
