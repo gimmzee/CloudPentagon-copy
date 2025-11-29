@@ -622,14 +622,6 @@ resource "aws_security_group" "ecs_frontend_sg" {
     security_groups = [aws_security_group.public_alb_sg.id]
   }
 
-  ingress {
-    description     = "App Port from Public ALB"
-    from_port       = 3000
-    to_port         = 3000
-    protocol        = "tcp"
-    security_groups = [aws_security_group.public_alb_sg.id]
-  }
-
   egress {
     from_port   = 0
     to_port     = 0
@@ -662,7 +654,7 @@ resource "aws_security_group" "ecs_backend_sg" {
   ingress {
     description     = "App Port from Internal ALB"
     from_port       = 8000
-    to_port         = 8000d
+    to_port         = 8000
     protocol        = "tcp"
     security_groups = [aws_security_group.internal_alb_sg.id]
   }
