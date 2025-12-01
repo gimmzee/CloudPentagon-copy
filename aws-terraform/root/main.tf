@@ -50,6 +50,14 @@ data "aws_ami" "rocky9" {
   }
 }
 
+# Amazon Linux 2023 최신 AMI 조회
+data "aws_ami" "amazon_linux_2023" {
+  filter {
+    name   = "image-id"
+    values = ["ami-04fcc2023d6e37430"]
+  }
+}
+
 # Data source for existing key pair
 data "aws_key_pair" "default" {
   key_name = "CloudPentagon"
@@ -1220,7 +1228,40 @@ resource "aws_appautoscaling_policy" "backend_cpu" {
   }
 }
 
+# ========================================
+# Secrets Manager 
+# ========================================
+# AWS Secrets Manager
+resource "aws_secretsmanager_secret" "aws_db_secret" {
+  name        = "db-credentials"
+  description = "Credentials for Aurora MySQL"
+}
 
+resource "aws_secretsmanager_secret_version" "aws_db_secret_value" {
+  secret_id = aws_secretsmanager_secret.aws_db_secret.id
+
+  secret_string = jsonencode({
+    idc_user   = "appuser"
+    idc_pw     = "P@ssw0rd"
+    rds_user   = "admin"
+    rds_pw     = "Soldeskqwe123"
+    azure_user = "azureadmin"
+    azure_pw   = "Soldeskqwe123!"
+    db_name    = "social_network"
+  })
+}
+
+# 비밀을 로컬 변수로 디코딩 (resource에서 바로 참조)
+locals {
+  db_credentials = jsondecode(
+    aws_secretsmanager_secret_version.aws_db_secret_value.secret_string
+  )
+}
+
+
+# ========================================
+# AWS Aurora RDS 
+# ========================================
 # RDS Subnet Group
 resource "aws_db_subnet_group" "aurora_subnet_group" {
   name       = "aurora-subnet-group"
@@ -1237,8 +1278,8 @@ resource "aws_rds_cluster" "aurora_cluster" {
   engine                         = "aurora-mysql"
   engine_version                 = "8.0.mysql_aurora.3.08.2"
   database_name                  = "mydatabase"
-  master_username                = "admin"
-  master_password                = "Soldeskqwe123" # 안전하게 관리 필요
+  master_username                = local.db_credentials.rds_user #"admin"
+  master_password                = local.db_credentials.rds_pw #"Soldeskqwe123" # 안전하게 관리 필요
   db_subnet_group_name           = aws_db_subnet_group.aurora_subnet_group.name
   skip_final_snapshot            = true
   backup_retention_period        = 1
@@ -1271,6 +1312,119 @@ resource "aws_rds_cluster_instance" "aurora_instance" {
   db_parameter_group_name = "default.aurora-mysql8.0" # 인스턴스 파라미터 그룹도 지정 가능
 }
 
+# ===============
+# WAF 설정   
+# ===============
+# WAFv2 Web ACL 생성
+resource "aws_wafv2_web_acl" "sns_webapp_waf" {
+  name  = "sns-webapp-waf"
+  scope = "REGIONAL"
+  default_action { 
+    allow {} 
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "sns-webapp-waf"
+    sampled_requests_enabled   = true
+  }
+
+  # 기본 웹 공격 방지
+  rule {
+    name     = "CommonRules"
+    priority = 1
+    override_action { 
+      none {} 
+    }
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "common-rules"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # 알려진 악성 입력 필터
+  rule {
+    name     = "KnownBadInputs"
+    priority = 2
+    override_action { 
+      none {} 
+    }
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesKnownBadInputsRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "known-bad-inputs"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # 관리자 페이지 보호 (/admin)
+  rule {
+    name     = "AdminProtection"
+    priority = 3
+    override_action { 
+      none {} 
+    }
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesAdminProtectionRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "admin-protection"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # Rate Limit Rule (초당 100 요청)
+  rule {
+    name     = "RateLimit"
+    priority = 4
+    action { 
+      block {} 
+    }
+    statement {
+      rate_based_statement {
+        limit              = 100
+        aggregate_key_type = "IP"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "rate-limit"
+      sampled_requests_enabled   = true
+    }
+  }
+}
+
+# ALB에 WAF 연결
+resource "aws_wafv2_web_acl_association" "alb_waf_assoc" {
+  resource_arn = aws_lb.public_alb.arn
+  web_acl_arn  = aws_wafv2_web_acl.sns_webapp_waf.arn
+}
+
+#CloudFront에 WAF 연결
+# resource "aws_wafv2_web_acl_association" "cloudfront_assoc" {
+#   resource_arn = "arn:aws:cloudfront::123456789012:distribution/EXISTING_DISTRIBUTION_ID"
+#   web_acl_arn  = aws_wafv2_web_acl.sns_webapp_waf.arn
+# }
+
+# ========================================
+# Route53 
+# ========================================
 # 퍼블릭 호스팅 영역 생성
 resource "aws_route53_zone" "public" {
   name = "607junha.cloud"
@@ -1323,7 +1477,10 @@ resource "aws_route53_record" "www" {
 #   records = ["<Azure 퍼블릭 IP 또는 Azure Front Door DNS>"]
 # }
 
-# 태스크 시작 vpn 연결 뒤 주석해제
+# ========================================
+# IDC to AWS DMS 설정
+# ========================================
+# AWS IDC vpn 연결 뒤 주석해제
 # #dms 역할
 # resource "aws_iam_role" "dms_vpc_role" {
 #   name = "dms-vpc-role"
@@ -1399,11 +1556,11 @@ resource "aws_route53_record" "www" {
 #   endpoint_id      = "idc-mysql-source"
 #   endpoint_type    = "source"
 #   engine_name      = "mysql"
-#   username         = "appuser"
-#   password         = "P@ssw0rd"
+#   username         = local.db_credentials.idc_user #"appuser"
+#   password         = local.db_credentials.idc_pw #"P@ssw0rd"
 #   server_name      = "10.0.1.100"   # IDC DB 고정 IP
 #   port             = 3306
-#   database_name    = "social_network"
+#   database_name    = local.db_credentials.db_name #"social_network"
 # }
 
 # # DMS Target Endpoint (AWS RDS)
@@ -1411,11 +1568,11 @@ resource "aws_route53_record" "www" {
 #   endpoint_id      = "rds-mysql-target"
 #   endpoint_type    = "target"
 #   engine_name      = "aurora"
-#   username         = "admin"
-#   password         = "Soldeskqwe123"
+#   username         = local.db_credentials.rds_user #"admin"
+#   password         = local.db_credentials.rds_pw #"Soldeskqwe123"
 #   server_name      = aws_rds_cluster.aurora_cluster.endpoint
 #   port             = 3306
-#   database_name    = "social_network"
+#   database_name    = local.db_credentials.db_name #"social_network"
 # }
 
 # # DMS Replication Task
@@ -1476,6 +1633,87 @@ resource "aws_route53_record" "www" {
 #   }
 # }
 
+# ===============================
+# AWS Aurora to Azure DMS 설정 #
+# ===============================
+# AWS Azure vpn 연결 뒤 주석해제
+# # DMS Replication Instance
+# resource "aws_dms_replication_instance" "dms_instance" {
+#   replication_instance_id   = "aurora-to-azure-dms"
+#   replication_instance_class = "dms.t3.micro"
+#   allocated_storage          = 50
+#   engine_version             = "3.5.4"
+#     tags = {
+#     Name = "Aurora-to-Azure-DMS"
+#   }
+# }
+
+# # Source Endpoint (Aurora MySQL)
+# resource "aws_dms_endpoint" "source_aurora" {
+#   endpoint_id   = "aws-aurora-source"
+#   endpoint_type = "source"
+#   engine_name   = "mysql"
+
+#   server_name   = aws_rds_cluster.aurora_cluster.endpoint
+#   port          = 3306
+#   username      = local.db_credentials.rds_user #"admin"
+#   password      = local.db_credentials.rds_pw #"Soldeskqwe123"
+#   database_name = local.db_credentials.db_name #"social_network"
+# }
+
+# # Target Endpoint (Azure MySQL)
+# resource "aws_dms_endpoint" "target_azure_mysql" {
+#   endpoint_id   = "azure-mysql-target"
+#   endpoint_type = "target"
+#   engine_name   = "mysql"
+
+#   server_name   = "your-azure-mysql.public.database.azure.com"
+#   port          = 3306
+#   username      = local.db_credentials.azure_user #"azureadmin"
+#   password      = local.db_credentials.azure_pw #"Soldeskqwe123!"
+#   database_name = local.db_credentials.db_name #"social_network"
+
+#   ssl_mode = "none"
+# }
+
+# # Replication Task
+# resource "aws_dms_replication_task" "aurora_to_azure_my_task" {
+#   replication_task_id      = "aurora-to-azure-mysql"
+#   replication_instance_arn = aws_dms_replication_instance.dms_instance.replication_instance_arn
+#   source_endpoint_arn      = aws_dms_endpoint.source_aurora.endpoint_arn
+#   target_endpoint_arn      = aws_dms_endpoint.target_azure_mysql.endpoint_arn
+#   migration_type           = "full-load-and-cdc"
+
+#   table_mappings = <<JSON
+# {
+#   "rules": [
+#     {
+#       "rule-type": "selection",
+#       "rule-id": "1",
+#       "rule-name": "1",
+#       "object-locator": {
+#         "schema-name": "%",
+#         "table-name": "%"
+#       },
+#       "rule-action": "include"
+#     }
+#   ]
+# }
+# JSON
+# }
+
+# # Start task
+# resource "null_resource" "start_aurora_to_azure_mysql" {
+#   depends_on = [aws_dms_replication_task.aurora_to_azure_my_task]
+#   provisioner "local-exec" {
+#     command = <<EOT
+# aws dms start-replication-task \
+#   --replication-task-arn ${aws_dms_replication_task.aurora_to_azure_my_task.replication_task_arn} \
+#   --start-replication-task-type start-replication
+# EOT
+#   }
+# }
+
 
 # # ============================================
 # # CloudWatch Alarms (모니터링)
@@ -1513,12 +1751,6 @@ resource "aws_route53_record" "www" {
 #     ServiceName = aws_ecs_service.backend.name
 #   }
 # }
-
-
-
-
-
-
 
 # ========================================
 # VPC2 - IDC 환경
@@ -1649,8 +1881,6 @@ resource "aws_eip" "idc_vpn_eip" {
   }
 }
 
-
-
 # IDC EC2 인스턴스
 resource "aws_instance" "idc_vpn_server" {
   ami           = data.aws_ami.rocky9.id
@@ -1671,7 +1901,8 @@ resource "aws_instance" "idc_vpn_server" {
     EOT
     source /etc/profile
 
-
+    EOF
+  )
 
   tags = {
     Name = "VPC2-IDC-CGW"
@@ -1783,6 +2014,35 @@ resource "aws_vpn_gateway_route_propagation" "route_propagation" {
   vpn_gateway_id = aws_vpn_gateway.vpc1_vgw.id
   route_table_id = aws_route_table.vpc1_public_rt.id
 }
+
+# ========================================
+# AWS Azure VPN 설정
+# ========================================
+# Azure VPN Gateway와 연결하는 설정 (주석 해제 후 사용)
+# # 1. Azure VPN Gateway 정보를 기반으로 Customer Gateway 생성
+# resource "aws_customer_gateway" "azure_vpn_cgw" {
+#   bgp_asn    = 65015            # Azure VPN Gateway BGP ASN
+#   ip_address = "Azure IP"   # Azure VPN Public IP
+#   type       = "ipsec.1"
+
+#   tags = {
+#     Name = "Azure-VPN-CGW"
+#   }
+# }
+
+# # 2. VGW와 연결할 VPN Connection 생성
+# resource "aws_vpn_connection" "vpc1_to_azure" {
+#   vpn_gateway_id      = aws_vpn_gateway.vpc1_vgw.id
+#   customer_gateway_id = aws_customer_gateway.azure_vpn_cgw.id
+#   type                = "ipsec.1"
+  
+#   # BGP를 사용할 경우
+#   static_routes_only = false
+
+#   tags = {
+#     Name = "VPC1-to-Azure-VPN"
+#   }
+# }
 
 
 # ========================================
