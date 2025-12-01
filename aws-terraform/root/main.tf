@@ -133,12 +133,40 @@ resource "aws_subnet" "vpc1_ecs_frontend_azc" {
 }
 
 # ========================================
+# 프라이빗 서브넷 (Internal ALB용)
+# ========================================
+
+resource "aws_subnet" "vpc1_private_alb_aza" {
+  vpc_id            = aws_vpc.vpc1.id
+  cidr_block        = "10.1.21.0/24"
+  availability_zone = "ap-northeast-2a"
+  map_public_ip_on_launch = false
+
+  tags = {
+    Name = "VPC1-Private-ALB-Subnet-AZ-A"
+    Tier = "Private-ALB"
+  }
+}
+
+resource "aws_subnet" "vpc1_private_alb_azc" {
+  vpc_id            = aws_vpc.vpc1.id
+  cidr_block        = "10.1.22.0/24"
+  availability_zone = "ap-northeast-2c"
+  map_public_ip_on_launch = false
+
+  tags = {
+    Name = "VPC1-Private-ALB-Subnet-AZ-C"
+    Tier = "Private-ALB"
+  }
+}
+
+# ========================================
 # ECS Backend 프라이빗 서브넷
 # ========================================
 
 resource "aws_subnet" "vpc1_ecs_backend_aza" {
   vpc_id                  = aws_vpc.vpc1.id
-  cidr_block              = "10.1.13.0/24"
+  cidr_block              = "10.1.31.0/24"
   availability_zone       = "ap-northeast-2a"
   map_public_ip_on_launch = false
 
@@ -150,7 +178,7 @@ resource "aws_subnet" "vpc1_ecs_backend_aza" {
 
 resource "aws_subnet" "vpc1_ecs_backend_azc" {
   vpc_id                  = aws_vpc.vpc1.id
-  cidr_block              = "10.1.14.0/24"
+  cidr_block              = "10.1.32.0/24"
   availability_zone       = "ap-northeast-2c"
   map_public_ip_on_launch = false
 
@@ -166,7 +194,7 @@ resource "aws_subnet" "vpc1_ecs_backend_azc" {
 
 resource "aws_subnet" "vpc1_db_aza" {
   vpc_id                  = aws_vpc.vpc1.id
-  cidr_block              = "10.1.21.0/24"
+  cidr_block              = "10.1.41.0/24"
   availability_zone       = "ap-northeast-2a"
   map_public_ip_on_launch = false
 
@@ -178,7 +206,7 @@ resource "aws_subnet" "vpc1_db_aza" {
 
 resource "aws_subnet" "vpc1_db_azc" {
   vpc_id                  = aws_vpc.vpc1.id
-  cidr_block              = "10.1.22.0/24"
+  cidr_block              = "10.1.42.0/24"
   availability_zone       = "ap-northeast-2c"
   map_public_ip_on_launch = false
 
@@ -1192,6 +1220,263 @@ resource "aws_appautoscaling_policy" "backend_cpu" {
   }
 }
 
+
+# RDS Subnet Group
+resource "aws_db_subnet_group" "aurora_subnet_group" {
+  name       = "aurora-subnet-group"
+  subnet_ids = [
+    aws_subnet.vpc1_db_aza.id,
+    aws_subnet.vpc1_db_azc.id
+  ]
+  description = "Aurora DB subnet group for VPC1"
+}
+
+# Aurora MySQL 클러스터
+resource "aws_rds_cluster" "aurora_cluster" {
+  cluster_identifier             = "cloudpentagon-cluster"
+  engine                         = "aurora-mysql"
+  engine_version                 = "8.0.mysql_aurora.3.08.2"
+  database_name                  = "mydatabase"
+  master_username                = "admin"
+  master_password                = "Soldeskqwe123" # 안전하게 관리 필요
+  db_subnet_group_name           = aws_db_subnet_group.aurora_subnet_group.name
+  skip_final_snapshot            = true
+  backup_retention_period        = 1
+  deletion_protection            = false
+  db_cluster_parameter_group_name = "default.aurora-mysql8.0" # 콘솔에서 만든 파라미터 그룹 이름
+  availability_zones = [
+    aws_subnet.vpc1_db_aza.availability_zone,
+    aws_subnet.vpc1_db_azc.availability_zone
+  ]
+  vpc_security_group_ids = [
+    aws_security_group.db_sg.id
+  ]
+  lifecycle {
+    ignore_changes = [
+      availability_zones,
+      engine_version
+    ]  
+  }  
+}
+
+# Aurora 클러스터 인스턴스
+resource "aws_rds_cluster_instance" "aurora_instance" {
+  count               = 2
+  identifier          = "aurora-instance-${count.index + 1}"
+  cluster_identifier  = aws_rds_cluster.aurora_cluster.id
+  instance_class      = "db.t3.medium"
+  engine              = aws_rds_cluster.aurora_cluster.engine
+  engine_version      = aws_rds_cluster.aurora_cluster.engine_version
+  publicly_accessible = false
+  db_parameter_group_name = "default.aurora-mysql8.0" # 인스턴스 파라미터 그룹도 지정 가능
+}
+
+# 퍼블릭 호스팅 영역 생성
+resource "aws_route53_zone" "public" {
+  name = "607junha.cloud"
+  comment = "Public hosted zone for 607junha.cloud"
+  force_destroy = true  # Terraform 삭제 시 레코드도 함께 삭제
+}
+
+# Route53 A 레코드 (ALB Alias)
+resource "aws_route53_record" "www" {
+  zone_id = aws_route53_zone.public.zone_id
+  name    = "www.607junha.cloud"
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.public_alb.dns_name
+    zone_id                = aws_lb.public_alb.zone_id
+    evaluate_target_health = true
+  }
+}
+
+# Failover
+# resource "aws_route53_record" "primary" {
+#   zone_id = aws_route53_zone.public.zone_id
+#   name    = "www.607junha.cloud"
+#   type    = "A"
+
+#   set_identifier = "AWS-ALB"
+#   failover_routing_policy {
+#     type = "PRIMARY"
+#   }
+
+#   alias {
+#     name                   = aws_lb.public_alb.dns_name
+#     zone_id                = aws_lb.public_alb.zone_id
+#     evaluate_target_health = true
+#   }
+# }
+
+# resource "aws_route53_record" "secondary" {
+#   zone_id = aws_route53_zone.public.zone_id
+#   name    = "www.607junha.cloud"
+#   type    = "A"
+
+#   set_identifier = "Azure"
+#   failover_routing_policy {
+#     type = "SECONDARY"
+#   }
+
+#   ttl     = 60
+#   records = ["<Azure 퍼블릭 IP 또는 Azure Front Door DNS>"]
+# }
+
+# 태스크 시작 vpn 연결 뒤 주석해제
+# #dms 역할
+# resource "aws_iam_role" "dms_vpc_role" {
+#   name = "dms-vpc-role"
+
+#   assume_role_policy = jsonencode({
+#     Version = "2012-10-17",
+#     Statement = [{
+#       Effect = "Allow",
+#       Principal = {
+#         Service = "dms.amazonaws.com"
+#       },
+#       Action = "sts:AssumeRole"
+#     }]
+#   })
+
+#   tags = {
+#     Name = "DMS-VPC-Role"
+#   }
+# }
+
+# resource "aws_iam_role_policy_attachment" "dms_vpc_policy_attach" {
+#   role       = aws_iam_role.dms_vpc_role.name
+#   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole"
+# }
+
+# # DMS Subnet Group
+# resource "aws_dms_replication_subnet_group" "dms_subnet_group" {
+#   replication_subnet_group_id          = "dms-subnet-group"
+#   subnet_ids                           = [aws_subnet.vpc1_db_aza.id, aws_subnet.vpc1_db_azc.id]
+#   replication_subnet_group_description = "DMS Subnet Group for VPC1 Private DB"
+# }
+
+# # DMS Security Group
+# resource "aws_security_group" "dms_sg" {
+#   name        = "dms-sg"
+#   description = "DMS Security Group"
+#   vpc_id      = aws_vpc.vpc1.id
+
+#   ingress {
+#     from_port   = 3306
+#     to_port     = 3306
+#     protocol    = "tcp"
+#     cidr_blocks = ["10.1.41.0/24", "10.1.42.0/24", "10.0.1.0/24"] # RDS 서브넷 + IDC DB
+#   }
+
+#   egress {
+#     from_port   = 0
+#     to_port     = 0
+#     protocol    = "-1"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+# }
+
+# # DMS Replication Instance
+# resource "aws_dms_replication_instance" "dms_instance" {
+#   replication_instance_id   = "dms-idc-to-aws"
+#   replication_instance_class = "dms.t3.micro"
+#   allocated_storage         = 50
+#   publicly_accessible       = false
+#   vpc_security_group_ids    = [aws_security_group.dms_sg.id]
+#   replication_subnet_group_id = aws_dms_replication_subnet_group.dms_subnet_group.id
+#   engine_version            = "3.5.4"
+#   depends_on = [
+#     aws_dms_replication_subnet_group.dms_subnet_group
+#   ]
+#   tags = {
+#   Name = "IDC-to-Aurora-DMS"
+#   }
+# }
+
+# # DMS Source Endpoint (IDC MySQL)
+# resource "aws_dms_endpoint" "source_idc" {
+#   endpoint_id      = "idc-mysql-source"
+#   endpoint_type    = "source"
+#   engine_name      = "mysql"
+#   username         = "appuser"
+#   password         = "P@ssw0rd"
+#   server_name      = "10.0.1.100"   # IDC DB 고정 IP
+#   port             = 3306
+#   database_name    = "social_network"
+# }
+
+# # DMS Target Endpoint (AWS RDS)
+# resource "aws_dms_endpoint" "target_rds" {
+#   endpoint_id      = "rds-mysql-target"
+#   endpoint_type    = "target"
+#   engine_name      = "aurora"
+#   username         = "admin"
+#   password         = "Soldeskqwe123"
+#   server_name      = aws_rds_cluster.aurora_cluster.endpoint
+#   port             = 3306
+#   database_name    = "social_network"
+# }
+
+# # DMS Replication Task
+# resource "aws_dms_replication_task" "idc_to_aurora_task" {
+#   replication_task_id      = "idc-to-aurora-task"
+#   replication_instance_arn = aws_dms_replication_instance.dms_instance.replication_instance_arn
+#   source_endpoint_arn = aws_dms_endpoint.source_idc.endpoint_arn
+#   target_endpoint_arn = aws_dms_endpoint.target_rds.endpoint_arn
+#   migration_type           = "full-load-and-cdc"
+
+#   table_mappings = <<JSON
+# {
+#   "rules": [
+#     {
+#       "rule-type": "selection",
+#       "rule-id": "1",
+#       "rule-name": "1",
+#       "object-locator": {
+#         "schema-name": "%",
+#         "table-name": "%"
+#       },
+#       "rule-action": "include"
+#     }
+#   ]
+# }
+# JSON
+
+#   replication_task_settings = <<JSON
+# {
+#   "TargetMetadata": {
+#     "TargetSchema": "",
+#     "SupportLobs": true,
+#     "FullLobMode": true
+#   },
+#   "FullLoadSettings": {
+#     "TargetTablePrepMode": "DO_NOTHING",
+#     "StopTaskCachedChangesApplied": false
+#   },
+#   "Logging": {
+#     "EnableLogging": true
+#   }
+# }
+# JSON
+#   depends_on = [
+#     aws_dms_replication_instance.dms_instance,
+#     aws_dms_endpoint.source_idc,
+#     aws_dms_endpoint.target_rds
+#   ]
+# }
+
+# # 태스크 시작 vpn
+# resource "null_resource" "start_dms_task" {
+#   depends_on = [aws_dms_replication_task.idc_to_aurora_task]
+#   provisioner "local-exec" {
+#     command = <<EOT
+#   aws dms start-replication-task --replication-task-arn ${aws_dms_replication_task.idc_to_aurora_task.replication_task_arn} --start-replication-task-type start-replication
+#   EOT
+#   }
+# }
+
+
 # # ============================================
 # # CloudWatch Alarms (모니터링)
 # # ============================================
@@ -1241,7 +1526,7 @@ resource "aws_appautoscaling_policy" "backend_cpu" {
 
 # VPC2 생성 (IDC 시뮬레이션)
 resource "aws_vpc" "vpc2" {
-  cidr_block           = "10.2.0.0/16"
+  cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
   enable_dns_support   = true
 
@@ -1261,7 +1546,7 @@ resource "aws_internet_gateway" "vpc2_igw" {
 # 프라이빗 서브넷 생성
 resource "aws_subnet" "vpc2_subnet" {
   vpc_id            = aws_vpc.vpc2.id
-  cidr_block        = "10.2.1.0/24"
+  cidr_block        = "10.0.1.0/24"
   availability_zone = "ap-northeast-2a"
 
   tags = {
@@ -1371,6 +1656,7 @@ resource "aws_instance" "idc_vpn_server" {
   ami           = data.aws_ami.rocky9.id
   instance_type = "t3.small"   # x86_64 기반
   subnet_id     = aws_subnet.vpc2_subnet.id
+  private_ip                  = "10.0.1.10"
   key_name = data.aws_key_pair.default.key_name
   vpc_security_group_ids = [aws_security_group.vpc2_idc_sg.id]
   source_dest_check = false
@@ -1378,130 +1664,51 @@ resource "aws_instance" "idc_vpn_server" {
   # VPN 소프트웨어 설치를 위한 초기 설정
     user_data = base64encode(<<-EOF
     #!/bin/bash
-    hostnamectl --static set-hostname VPC2-IDC-DB
+    hostnamectl --static set-hostname VPC2-IDC-CGW
 
     cat <<'EOT' > /etc/profile.d/prompt.sh
     export PS1="[\[\e[1;31m\]\u\[\e[m\]@\[\e[1;32m\]\h\[\e[m\]: \[\e[1;36m\]\w\[\e[m\]]#"
     EOT
     source /etc/profile
 
-    # MariaDB 10.5 설치
-    dnf install -y mariadb105-server mariadb105
 
-    # 서비스 활성화
-    systemctl enable --now mariadb
-
-    cat >> /etc/my.cnf <<'EOF2'
-    [client]
-    default-character-set = utf8mb4
-
-    [mysql]
-    default-character-set = utf8mb4
-
-    [mysqld]
-    bind-address = 0.0.0.0
-    character-set-server = utf8mb4
-    collation-server = utf8mb4_unicode_ci
-    skip-character-set-client-handshake
-    default_authentication_plugin = mysql_native_password
-    log-bin=mysql-bin
-    server-id=2
-    read_only=1
-    EOF2
-
-    systemctl restart mariadb
-
-    # 보안 초기화 SQL
-    cat > /root/secure_mariadb.sql <<'EOF3'
-    DROP DATABASE IF EXISTS test;
-    DELETE FROM mysql.db WHERE Db LIKE 'test%';
-
-    DROP USER IF EXISTS ''@'localhost';
-    DROP USER IF EXISTS ''@'%';
-
-    DROP USER IF EXISTS 'root'@'::1';
-    DROP USER IF EXISTS 'root'@'127.0.0.1';
-    ALTER USER 'root'@'localhost' IDENTIFIED BY 'P@ssw0rd';
-
-    FLUSH PRIVILEGES;
-    EOF3
-
-    mysql --protocol=socket -uroot < /root/secure_mariadb.sql
-
-    # 사용자/DB/테이블 생성
-    cat > /root/init_sqldb.sql <<'SQL'
-    CREATE USER IF NOT EXISTS 'user1'@'%' IDENTIFIED BY 'P@ssw0rd';
-    GRANT ALL PRIVILEGES ON *.* TO 'user1'@'%' WITH GRANT OPTION;
-
-    CREATE DATABASE IF NOT EXISTS sqlDB
-      CHARACTER SET utf8mb4
-      COLLATE utf8mb4_unicode_ci;
-
-    USE sqlDB;
-
-    CREATE TABLE IF NOT EXISTS userTBL
-    (
-      userID    CHAR(8)      NOT NULL PRIMARY KEY,
-      name      NVARCHAR(10) NOT NULL,
-      birthYear INT          NOT NULL,
-      addr      NCHAR(2)     NOT NULL,
-      mobile1   CHAR(3),
-      mobile2   CHAR(8),
-      height    SMALLINT,
-      mDATE     DATE
-    );
-
-    INSERT INTO userTBL VALUES ('LSG','이승기',1987,'서울','011','1111111',182,'2008-08-08');
-    INSERT INTO userTBL VALUES ('KBS','김범수',1979,'경남','011','2222222',173,'2012-04-04');
-    INSERT INTO userTBL VALUES ('KKH','김경호',1971,'전남','019','3333333',177,'2007-07-07');
-    INSERT INTO userTBL VALUES ('JYP','조용필',1950,'경기','011','4444444',166,'2009-04-04');
-    INSERT INTO userTBL VALUES ('SSK','성시경',1979,'서울',NULL,NULL,186,'2013-12-12');
-    INSERT INTO userTBL VALUES ('LJB','임재범',1963,'서울','016','6666666',182,'2009-09-09');
-    INSERT INTO userTBL VALUES ('YJS','윤종신',1969,'경남',NULL,NULL,170,'2005-05-05');
-    INSERT INTO userTBL VALUES ('EJW','은지원',1972,'경북','011','8888888',174,'2014-03-03');
-    INSERT INTO userTBL VALUES ('JKW','조관우',1965,'경기','018','9999999',172,'2010-10-10');
-    INSERT INTO userTBL VALUES ('BBK','바비킴',1973,'서울','010','0000000',176,'2013-05-05');
-    INSERT INTO userTBL VALUES ('JUL','김주일',1978,'서울','010','0000000',176,'2013-05-05');
-    INSERT INTO userTBL VALUES ('CSJ','최소진',1986,'서울','010','0000000',176,'2013-05-05');
-
-    FLUSH PRIVILEGES;
-    SQL
-
-    mysql -uroot -p'P@ssw0rd' < /root/init_sqldb.sql
-
-    cat <<EOT> /home/ec2-user/list.txt
-    10.1.3.100
-    websrv1.awsseoul.internal
-    10.1.4.100
-    websrv2.awsseoul.internal
-    10.2.1.100
-    dbsrv.idcseoul.internal
-    10.2.1.200
-    dnssrv.idcseoul.internal
-    10.3.3.100
-    websrv1.awssingapore.internal
-    10.4.1.100
-    dbsrv.idcsingapore.internal
-    10.4.1.200
-    dnssrv.idcsingapore.internal
-    EOT
-
-    curl -o /home/ec2-user/pingall.sh https://cloudneta-book.s3.ap-northeast-2.amazonaws.com/chapter6/pingall.sh --silent
-    chmod +x /home/ec2-user/pingall.sh
-    EOF
-  )
 
   tags = {
-    Name = "VPC2-IDC-DB"
+    Name = "VPC2-IDC-CGW"
   }
 }
 
+# IDC DB 인스턴스
+resource "aws_instance" "idc_DB_server" {
+  ami           = data.aws_ami.amazon_linux_2023.id
+  instance_type = "t3.small"
+  subnet_id     = aws_subnet.vpc2_subnet.id
+  private_ip                  = "10.0.1.100"
+  associate_public_ip_address = true
+  key_name      = data.aws_key_pair.default.key_name
+  vpc_security_group_ids = [aws_security_group.vpc2_idc_sg.id]
+  source_dest_check      = false
+    
+    user_data = base64encode(<<-EOF
+    #!/bin/bash
+    hostnamectl set-hostname VPC2-IDC-DB
+    cat <<'EOT' > /etc/profile.d/prompt.sh
+    export PS1="[\[\e[1;31m\]\u\[\e[m\]@\[\e[1;32m\]\h\[\e[m\]: \[\e[1;36m\]\w\[\e[m\]]#"
+    EOT
+    source /etc/profile
+    EOF
+    )
+  tags = {
+  Name = "VPC2-IDC-DB"
+  }
+}
 
 # EIP를 EC2에 연결
 resource "aws_eip_association" "idc_eip_assoc" {
   instance_id   = aws_instance.idc_vpn_server.id
   allocation_id = aws_eip.idc_vpn_eip.id
 }
+
 
 # ========================================
 # VPC1 - AWS 클라우드 환경
@@ -1534,7 +1741,7 @@ resource "aws_vpn_connection" "vpc1_vpn" {
   customer_gateway_id = aws_customer_gateway.vpc1_cgw.id
   vpn_gateway_id      = aws_vpn_gateway.vpc1_vgw.id
   type                = "ipsec.1"
-  static_routes_only  = true  # Static routing 사용 (EC2 VPN이므로)
+  static_routes_only  = false
 
   # Tunnel 1 설정
   tunnel1_preshared_key = "cloudneta"
@@ -1549,16 +1756,16 @@ resource "aws_vpn_connection" "vpc1_vpn" {
   }
 }
 
-# Static Route 추가 (VPC2 대역)
-resource "aws_vpn_connection_route" "vpc2_route" {
-  destination_cidr_block = "10.2.0.0/16"
-  vpn_connection_id      = aws_vpn_connection.vpc1_vpn.id
-}
+# # Static Route 추가 (VPC0 대역)
+# resource "aws_vpn_connection_route" "vpc2_route" {
+#   destination_cidr_block = "10.0.0.0/16"
+#   vpn_connection_id      = aws_vpn_connection.vpc1_vpn.id
+# }
 
-# VPC1 Route Table에서 IDC(VPC2)로 가는 라우트
+# VPC1 Route Table에서 IDC(VPC0)로 가는 라우트
 resource "aws_route" "vpc1_to_idc" {
   route_table_id         = aws_route_table.vpc1_db_rt_aza.id
-  destination_cidr_block = "10.2.0.0/16"  # VPC2(IDC) 대역
+  destination_cidr_block = "10.0.0.0/16"  # VPC0(IDC) 대역
   gateway_id             = aws_vpn_gateway.vpc1_vgw.id
   depends_on             = [aws_vpn_connection.vpc1_vpn]
 }
@@ -1576,7 +1783,6 @@ resource "aws_vpn_gateway_route_propagation" "route_propagation" {
   vpn_gateway_id = aws_vpn_gateway.vpc1_vgw.id
   route_table_id = aws_route_table.vpc1_public_rt.id
 }
-
 
 
 # ========================================
