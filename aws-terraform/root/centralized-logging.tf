@@ -386,10 +386,7 @@ resource "aws_opensearch_domain" "logs" {
       {
         Effect = "Allow"
         Principal = {
-          AWS = [
-            aws_iam_role.logs_to_opensearch_lambda.arn,
-            data.aws_caller_identity.current.arn  # (필요 시)
-          ]
+          AWS = "*"  # 모두 허용
         }
         Action   = "es:*"
         Resource = "arn:aws:es:ap-northeast-2:${data.aws_caller_identity.current.account_id}:domain/${var.project_name}-logs/*"
