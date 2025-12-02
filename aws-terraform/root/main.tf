@@ -60,7 +60,7 @@ data "aws_ami" "amazon_linux_2023" {
 
 # Data source for existing key pair
 data "aws_key_pair" "default" {
-  key_name = "CloudPentagon"
+  key_name = "soldesk-507"
 }
 
 
@@ -882,26 +882,26 @@ resource "aws_lb_listener" "internal_alb_listener" {
 #   })
 # }
 
-# ============================================
-# CloudWatch 로그 그룹
-# ============================================
-resource "aws_cloudwatch_log_group" "frontend" {
-  name              = "/ecs/frontend"
-  retention_in_days = 30
+# # ============================================
+# # CloudWatch 로그 그룹
+# # ============================================
+# resource "aws_cloudwatch_log_group" "frontend" {
+#   name              = "/ecs/frontend"
+#   retention_in_days = 30
   
-  tags = {
-    Name = "frontend-logs"
-  }
-}
+#   tags = {
+#     Name = "frontend-logs"
+#   }
+# }
 
-resource "aws_cloudwatch_log_group" "backend" {
-  name              = "/ecs/backend"
-  retention_in_days = 30
+# resource "aws_cloudwatch_log_group" "backend" {
+#   name              = "/ecs/backend"
+#   retention_in_days = 30
   
-  tags = {
-    Name = "backend-logs"
-  }
-}
+#   tags = {
+#     Name = "backend-logs"
+#   }
+# }
 
 # ============================================
 # IAM 역할
@@ -920,6 +920,10 @@ resource "aws_iam_role" "ecs_task_execution_role" {
       }
     }]
   })
+}
+resource "aws_iam_role_policy_attachment" "ecs_task_execution_cloudwatch" {
+  role       = aws_iam_role.ecs_task_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchLogsFullAccess"
 }
 
 resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_policy" {
@@ -1007,7 +1011,7 @@ resource "aws_ecs_task_definition" "frontend" {
 
   container_definitions = jsonencode([{
     name      = "frontend-container" #컨테이너 이름 
-    image     = "246737816332.dkr.ecr.ap-northeast-2.amazonaws.com/frontend-app:latest"   #repository_url 설정해주기
+    image     = "962698957678.dkr.ecr.ap-northeast-2.amazonaws.com/frontend-app:latest"   #repository_url 설정해주기
     essential = true
 
     portMappings = [{
@@ -1018,9 +1022,10 @@ resource "aws_ecs_task_definition" "frontend" {
     logConfiguration = {
       logDriver = "awslogs"
       options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.frontend.name
+        "awslogs-group"         = "/aws/ecs/${var.project_name}/frontend"
         "awslogs-region"        = "ap-northeast-2"
         "awslogs-stream-prefix" = "ecs"
+        "awslogs-create-group"  = "true"
       }
     }
   }])
@@ -1044,7 +1049,7 @@ resource "aws_ecs_task_definition" "backend" {
 
   container_definitions = jsonencode([{
     name      = "backend-container" #컨테이너 이름 
-    image     = "246737816332.dkr.ecr.ap-northeast-2.amazonaws.com/backend-app:latest"
+    image     = "962698957678.dkr.ecr.ap-northeast-2.amazonaws.com/backend-app:latest"
     essential = true
 
     portMappings = [{
@@ -1067,7 +1072,7 @@ resource "aws_ecs_task_definition" "backend" {
       },
             {
         name  = "DB_PASSWORD"  
-        value = "DB 비밀번호" 
+        value = "Soldeskqwe123" 
       },
             {
         name  = "DB_URL"  
@@ -1082,9 +1087,10 @@ resource "aws_ecs_task_definition" "backend" {
     logConfiguration = {
       logDriver = "awslogs"
       options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.backend.name
+        "awslogs-group"         = "/aws/ecs/${var.project_name}/backend"
         "awslogs-region"        = "ap-northeast-2"
         "awslogs-stream-prefix" = "ecs"
+        "awslogs-create-group"  = "true"
       }
     }
   }])
@@ -1233,7 +1239,7 @@ resource "aws_appautoscaling_policy" "backend_cpu" {
 # ========================================
 # AWS Secrets Manager
 resource "aws_secretsmanager_secret" "aws_db_secret" {
-  name        = "db-credentials"
+  name        = "db-credentials-dev-v2"
   description = "Credentials for Aurora MySQL"
 }
 
@@ -1260,7 +1266,7 @@ locals {
 
 
 # ========================================
-# AWS Aurora RDS 
+# AWS Aurora RDS - CloudWatch Logs 설정 포함
 # ========================================
 # RDS Subnet Group
 resource "aws_db_subnet_group" "aurora_subnet_group" {
@@ -1270,6 +1276,50 @@ resource "aws_db_subnet_group" "aurora_subnet_group" {
     aws_subnet.vpc1_db_azc.id
   ]
   description = "Aurora DB subnet group for VPC1"
+
+    tags = {
+    Name        = "Aurora-Subnet-Group"
+    Environment = var.environment
+  }
+}
+
+# ⭐ Aurora 클러스터 파라미터 그룹 (슬로우 쿼리 로깅 활성화)
+resource "aws_rds_cluster_parameter_group" "aurora_logging" {
+  name        = "${var.project_name}-aurora-cluster-logging"
+  family      = "aurora-mysql8.0" # ⚠️ aurora-mysql8.0 (mysql8.0 아님!)
+  description = "Aurora cluster parameter group for logging"
+
+  parameter {
+    name  = "slow_query_log"
+    value = "1"
+  }
+
+  parameter {
+    name  = "long_query_time"
+    value = "2"  # 2초 이상 걸리는 쿼리
+  }
+
+  parameter {
+    name  = "log_queries_not_using_indexes"
+    value = "1"
+  }
+
+  tags = {
+    Name        = "Aurora-Cluster-Logging-ParameterGroup"
+    Environment = var.environment
+  }
+}
+
+# ⭐ Aurora 인스턴스 파라미터 그룹
+resource "aws_db_parameter_group" "aurora_instance_logging" {
+  name        = "${var.project_name}-aurora-instance-logging"
+  family      = "aurora-mysql8.0"
+  description = "Aurora instance parameter group"
+
+  tags = {
+    Name        = "Aurora-Instance-ParameterGroup"
+    Environment = var.environment
+  }
 }
 
 # Aurora MySQL 클러스터
@@ -1284,7 +1334,13 @@ resource "aws_rds_cluster" "aurora_cluster" {
   skip_final_snapshot            = true
   backup_retention_period        = 1
   deletion_protection            = false
-  db_cluster_parameter_group_name = "default.aurora-mysql8.0" # 콘솔에서 만든 파라미터 그룹 이름
+
+  # ⭐ 클러스터 레벨에서 CloudWatch Logs 활성화 (중요!)
+  enabled_cloudwatch_logs_exports = ["error", "slowquery"]
+
+  # ⭐ 클러스터 파라미터 그룹 연결
+  db_cluster_parameter_group_name = aws_rds_cluster_parameter_group.aurora_logging.name
+
   availability_zones = [
     aws_subnet.vpc1_db_aza.availability_zone,
     aws_subnet.vpc1_db_azc.availability_zone
@@ -1297,7 +1353,12 @@ resource "aws_rds_cluster" "aurora_cluster" {
       availability_zones,
       engine_version
     ]  
-  }  
+  }
+
+  tags = {
+    Name        = "CloudPentagon-Aurora-Cluster"
+    Environment = var.environment
+  }
 }
 
 # Aurora 클러스터 인스턴스
@@ -1309,112 +1370,119 @@ resource "aws_rds_cluster_instance" "aurora_instance" {
   engine              = aws_rds_cluster.aurora_cluster.engine
   engine_version      = aws_rds_cluster.aurora_cluster.engine_version
   publicly_accessible = false
-  db_parameter_group_name = "default.aurora-mysql8.0" # 인스턴스 파라미터 그룹도 지정 가능
-}
 
-# ===============
-# WAF 설정   
-# ===============
-# WAFv2 Web ACL 생성
-resource "aws_wafv2_web_acl" "sns_webapp_waf" {
-  name  = "sns-webapp-waf"
-  scope = "REGIONAL"
-  default_action { 
-    allow {} 
-  }
+  # ⭐ 인스턴스 파라미터 그룹 연결
+  db_parameter_group_name = aws_db_parameter_group.aurora_instance_logging.name
 
-  visibility_config {
-    cloudwatch_metrics_enabled = true
-    metric_name                = "sns-webapp-waf"
-    sampled_requests_enabled   = true
-  }
-
-  # 기본 웹 공격 방지
-  rule {
-    name     = "CommonRules"
-    priority = 1
-    override_action { 
-      none {} 
-    }
-    statement {
-      managed_rule_group_statement {
-        name        = "AWSManagedRulesCommonRuleSet"
-        vendor_name = "AWS"
-      }
-    }
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "common-rules"
-      sampled_requests_enabled   = true
-    }
-  }
-
-  # 알려진 악성 입력 필터
-  rule {
-    name     = "KnownBadInputs"
-    priority = 2
-    override_action { 
-      none {} 
-    }
-    statement {
-      managed_rule_group_statement {
-        name        = "AWSManagedRulesKnownBadInputsRuleSet"
-        vendor_name = "AWS"
-      }
-    }
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "known-bad-inputs"
-      sampled_requests_enabled   = true
-    }
-  }
-
-  # 관리자 페이지 보호 (/admin)
-  rule {
-    name     = "AdminProtection"
-    priority = 3
-    override_action { 
-      none {} 
-    }
-    statement {
-      managed_rule_group_statement {
-        name        = "AWSManagedRulesAdminProtectionRuleSet"
-        vendor_name = "AWS"
-      }
-    }
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "admin-protection"
-      sampled_requests_enabled   = true
-    }
-  }
-
-  # Rate Limit Rule (초당 100 요청)
-  rule {
-    name     = "RateLimit"
-    priority = 4
-    action { 
-      block {} 
-    }
-    statement {
-      rate_based_statement {
-        limit              = 100
-        aggregate_key_type = "IP"
-      }
-    }
-    visibility_config {
-      cloudwatch_metrics_enabled = true
-      metric_name                = "rate-limit"
-      sampled_requests_enabled   = true
-    }
+  tags = {
+    Name        = "Aurora-Instance-${count.index + 1}"
+    Environment = var.environment
   }
 }
 
-# ALB에 WAF 연결
-resource "aws_wafv2_web_acl_association" "alb_waf_assoc" {
-  resource_arn = aws_lb.public_alb.arn
-  web_acl_arn  = aws_wafv2_web_acl.sns_webapp_waf.arn
-}
+# # ===============
+# # WAF 설정   
+# # ===============
+# # WAFv2 Web ACL 생성
+# resource "aws_wafv2_web_acl" "sns_webapp_waf" {
+#   name  = "sns-webapp-waf"
+#   scope = "REGIONAL"
+#   default_action { 
+#     allow {} 
+#   }
+
+#   visibility_config {
+#     cloudwatch_metrics_enabled = true
+#     metric_name                = "sns-webapp-waf"
+#     sampled_requests_enabled   = true
+#   }
+
+#   # 기본 웹 공격 방지
+#   rule {
+#     name     = "CommonRules"
+#     priority = 1
+#     override_action { 
+#       none {} 
+#     }
+#     statement {
+#       managed_rule_group_statement {
+#         name        = "AWSManagedRulesCommonRuleSet"
+#         vendor_name = "AWS"
+#       }
+#     }
+#     visibility_config {
+#       cloudwatch_metrics_enabled = true
+#       metric_name                = "common-rules"
+#       sampled_requests_enabled   = true
+#     }
+#   }
+
+#   # 알려진 악성 입력 필터
+#   rule {
+#     name     = "KnownBadInputs"
+#     priority = 2
+#     override_action { 
+#       none {} 
+#     }
+#     statement {
+#       managed_rule_group_statement {
+#         name        = "AWSManagedRulesKnownBadInputsRuleSet"
+#         vendor_name = "AWS"
+#       }
+#     }
+#     visibility_config {
+#       cloudwatch_metrics_enabled = true
+#       metric_name                = "known-bad-inputs"
+#       sampled_requests_enabled   = true
+#     }
+#   }
+
+#   # 관리자 페이지 보호 (/admin)
+#   rule {
+#     name     = "AdminProtection"
+#     priority = 3
+#     override_action { 
+#       none {} 
+#     }
+#     statement {
+#       managed_rule_group_statement {
+#         name        = "AWSManagedRulesAdminProtectionRuleSet"
+#         vendor_name = "AWS"
+#       }
+#     }
+#     visibility_config {
+#       cloudwatch_metrics_enabled = true
+#       metric_name                = "admin-protection"
+#       sampled_requests_enabled   = true
+#     }
+#   }
+
+#   # Rate Limit Rule (초당 100 요청)
+#   rule {
+#     name     = "RateLimit"
+#     priority = 4
+#     action { 
+#       block {} 
+#     }
+#     statement {
+#       rate_based_statement {
+#         limit              = 100
+#         aggregate_key_type = "IP"
+#       }
+#     }
+#     visibility_config {
+#       cloudwatch_metrics_enabled = true
+#       metric_name                = "rate-limit"
+#       sampled_requests_enabled   = true
+#     }
+#   }
+# }
+
+# # ALB에 WAF 연결
+# resource "aws_wafv2_web_acl_association" "alb_waf_assoc" {
+#   resource_arn = aws_lb.public_alb.arn
+#   web_acl_arn  = aws_wafv2_web_acl.sns_webapp_waf.arn
+# }
 
 #CloudFront에 WAF 연결
 # resource "aws_wafv2_web_acl_association" "cloudfront_assoc" {
@@ -1422,28 +1490,28 @@ resource "aws_wafv2_web_acl_association" "alb_waf_assoc" {
 #   web_acl_arn  = aws_wafv2_web_acl.sns_webapp_waf.arn
 # }
 
-# ========================================
-# Route53 
-# ========================================
-# 퍼블릭 호스팅 영역 생성
-resource "aws_route53_zone" "public" {
-  name = "607junha.cloud"
-  comment = "Public hosted zone for 607junha.cloud"
-  force_destroy = true  # Terraform 삭제 시 레코드도 함께 삭제
-}
+# # ========================================
+# # Route53 
+# # ========================================
+# # 퍼블릭 호스팅 영역 생성
+# resource "aws_route53_zone" "public" {
+#   name = "607junha.cloud"
+#   comment = "Public hosted zone for 607junha.cloud"
+#   force_destroy = true  # Terraform 삭제 시 레코드도 함께 삭제
+# }
 
-# Route53 A 레코드 (ALB Alias)
-resource "aws_route53_record" "www" {
-  zone_id = aws_route53_zone.public.zone_id
-  name    = "www.607junha.cloud"
-  type    = "A"
+# # Route53 A 레코드 (ALB Alias)
+# resource "aws_route53_record" "www" {
+#   zone_id = aws_route53_zone.public.zone_id
+#   name    = "www.607junha.cloud"
+#   type    = "A"
 
-  alias {
-    name                   = aws_lb.public_alb.dns_name
-    zone_id                = aws_lb.public_alb.zone_id
-    evaluate_target_health = true
-  }
-}
+#   alias {
+#     name                   = aws_lb.public_alb.dns_name
+#     zone_id                = aws_lb.public_alb.zone_id
+#     evaluate_target_health = true
+#   }
+# }
 
 # Failover
 # resource "aws_route53_record" "primary" {
@@ -1752,341 +1820,359 @@ resource "aws_route53_record" "www" {
 #   }
 # }
 
-# ========================================
-# VPC2 - IDC 환경
-# ========================================
+# # ========================================
+# # VPC2 - IDC 환경
+# # ========================================
 
-# VPC2 생성 (IDC 시뮬레이션)
-resource "aws_vpc" "vpc2" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_hostnames = true
-  enable_dns_support   = true
+# # VPC2 생성 (IDC 시뮬레이션)
+# resource "aws_vpc" "vpc2" {
+#   cidr_block           = "10.0.0.0/16"
+#   enable_dns_hostnames = true
+#   enable_dns_support   = true
 
-  tags = {
-    Name = "VPC2-Seoul-IDC"
-  }
-}
-
-resource "aws_internet_gateway" "vpc2_igw" {
-  vpc_id = aws_vpc.vpc2.id
-
-  tags = {
-    Name = "VPC2-IGW"
-  }
-}
-
-# 프라이빗 서브넷 생성
-resource "aws_subnet" "vpc2_subnet" {
-  vpc_id            = aws_vpc.vpc2.id
-  cidr_block        = "10.0.1.0/24"
-  availability_zone = "ap-northeast-2a"
-
-  tags = {
-    Name = "VPC2-Seoul-IDC-Subnet"
-  }
-}
-
-# 프라이빗 라우트 테이블 생성
-resource "aws_route_table" "vpc2_rt" {
-  vpc_id = aws_vpc.vpc2.id
-
-  tags = {
-    Name = "VPC2-IDC-RouteTable"
-  }
-}
-
-resource "aws_route" "vpc2_internet_route" {
-  route_table_id         = aws_route_table.vpc2_rt.id
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.vpc2_igw.id
-}
-
-# 서브넷과 라우트 테이블 연결
-resource "aws_route_table_association" "vpc2_assoc" {
-  subnet_id      = aws_subnet.vpc2_subnet.id
-  route_table_id = aws_route_table.vpc2_rt.id
-}
-
-# ========================================
-# IDC EC2 인스턴스 (VPN 장비 역할)
-# ========================================
-
-# 보안 그룹 생성
-resource "aws_security_group" "vpc2_idc_sg" {
-  name        = "vpc2-idc-sg"
-  description = "Security group for IDC EC2"
-  vpc_id      = aws_vpc.vpc2.id
-
-  # VPN 트래픽 허용
-  ingress {
-    description = "SSH Access"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "IPSec IKE"
-    from_port   = 500
-    to_port     = 500
-    protocol    = "udp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "IPSec NAT-T"
-    from_port   = 4500
-    to_port     = 4500
-    protocol    = "udp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # VPC1에서 오는 트래픽 허용
-  ingress {
-    description = "From VPC1"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["10.1.0.0/16"]
-  }
-
-  # VPC2 내부 통신
-  ingress {
-    description = "VPC2 Internal"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["10.2.0.0/16"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "VPC2-IDC-SecurityGroup"
-  }
-}
-
-# IDC EC2 인스턴스용 EIP
-resource "aws_eip" "idc_vpn_eip" {
-  domain = "vpc"
-
-  tags = {
-    Name = "IDC-VPN-Device-EIP"
-  }
-}
-
-# IDC EC2 인스턴스
-resource "aws_instance" "idc_vpn_server" {
-  ami           = data.aws_ami.rocky9.id
-  instance_type = "t3.small"   # x86_64 기반
-  subnet_id     = aws_subnet.vpc2_subnet.id
-  private_ip                  = "10.0.1.10"
-  key_name = data.aws_key_pair.default.key_name
-  vpc_security_group_ids = [aws_security_group.vpc2_idc_sg.id]
-  source_dest_check = false
-
-  # VPN 소프트웨어 설치를 위한 초기 설정
-    user_data = base64encode(<<-EOF
-    #!/bin/bash
-    hostnamectl --static set-hostname VPC2-IDC-CGW
-
-    cat <<'EOT' > /etc/profile.d/prompt.sh
-    export PS1="[\[\e[1;31m\]\u\[\e[m\]@\[\e[1;32m\]\h\[\e[m\]: \[\e[1;36m\]\w\[\e[m\]]#"
-    EOT
-    source /etc/profile
-
-    EOF
-  )
-
-  tags = {
-    Name = "VPC2-IDC-CGW"
-  }
-}
-
-# IDC DB 인스턴스
-resource "aws_instance" "idc_DB_server" {
-  ami           = data.aws_ami.amazon_linux_2023.id
-  instance_type = "t3.small"
-  subnet_id     = aws_subnet.vpc2_subnet.id
-  private_ip                  = "10.0.1.100"
-  associate_public_ip_address = true
-  key_name      = data.aws_key_pair.default.key_name
-  vpc_security_group_ids = [aws_security_group.vpc2_idc_sg.id]
-  source_dest_check      = false
-    
-    user_data = base64encode(<<-EOF
-    #!/bin/bash
-    hostnamectl set-hostname VPC2-IDC-DB
-    cat <<'EOT' > /etc/profile.d/prompt.sh
-    export PS1="[\[\e[1;31m\]\u\[\e[m\]@\[\e[1;32m\]\h\[\e[m\]: \[\e[1;36m\]\w\[\e[m\]]#"
-    EOT
-    source /etc/profile
-    EOF
-    )
-  tags = {
-  Name = "VPC2-IDC-DB"
-  }
-}
-
-# EIP를 EC2에 연결
-resource "aws_eip_association" "idc_eip_assoc" {
-  instance_id   = aws_instance.idc_vpn_server.id
-  allocation_id = aws_eip.idc_vpn_eip.id
-}
-
-
-# ========================================
-# VPC1 - AWS 클라우드 환경
-# ========================================
-
-# Customer Gateway (IDC 측 VPN 장비)
-resource "aws_customer_gateway" "vpc1_cgw" {
-  bgp_asn    = 65000
-  ip_address = aws_eip.idc_vpn_eip.public_ip  # IDC EC2의 EIP 사용
-  type       = "ipsec.1"
-
-  tags = {
-    Name = "VPC1-Seoul-CustomerGateway-IDC"
-  }
-
-  depends_on = [aws_eip.idc_vpn_eip]
-}
-
-# Virtual Private Gateway (VPC1에 연결)
-resource "aws_vpn_gateway" "vpc1_vgw" {
-  vpc_id = aws_vpc.vpc1.id
-
-  tags = {
-    Name = "VPC1-Seoul-VirtualPrivateGateway"
-  }
-}
-
-# VPN Connection
-resource "aws_vpn_connection" "vpc1_vpn" {
-  customer_gateway_id = aws_customer_gateway.vpc1_cgw.id
-  vpn_gateway_id      = aws_vpn_gateway.vpc1_vgw.id
-  type                = "ipsec.1"
-  static_routes_only  = false
-
-  # Tunnel 1 설정
-  tunnel1_preshared_key = "cloudneta"
-  tunnel1_inside_cidr   = "169.254.159.32/30"
-
-  # Tunnel 2 설정
-  tunnel2_preshared_key = "cloudneta"
-  tunnel2_inside_cidr   = "169.254.210.148/30"
-
-  tags = {
-    Name = "VPC1-Seoul-AWS-VPNConnection-IDC"
-  }
-}
-
-# # Static Route 추가 (VPC0 대역)
-# resource "aws_vpn_connection_route" "vpc2_route" {
-#   destination_cidr_block = "10.0.0.0/16"
-#   vpn_connection_id      = aws_vpn_connection.vpc1_vpn.id
+#   tags = {
+#     Name = "VPC2-Seoul-IDC"
+#   }
 # }
 
-# VPC1 Route Table에서 IDC(VPC0)로 가는 라우트
-resource "aws_route" "vpc1_to_idc" {
-  route_table_id         = aws_route_table.vpc1_db_rt_aza.id
-  destination_cidr_block = "10.0.0.0/16"  # VPC0(IDC) 대역
-  gateway_id             = aws_vpn_gateway.vpc1_vgw.id
-  depends_on             = [aws_vpn_connection.vpc1_vpn]
-}
+# resource "aws_internet_gateway" "vpc2_igw" {
+#   vpc_id = aws_vpc.vpc2.id
 
-# VPC2 Route Table에서 VPC1으로 가는 라우트
-resource "aws_route" "vpc2_to_vpc1" {
-  route_table_id         = aws_route_table.vpc2_rt.id
-  destination_cidr_block = "10.1.0.0/16"  # VPC1 대역
-  network_interface_id   = aws_instance.idc_vpn_server.primary_network_interface_id
-  depends_on             = [aws_instance.idc_vpn_server]
-}
+#   tags = {
+#     Name = "VPC2-IGW"
+#   }
+# }
 
-# VPN을 통해 학습한 라우트가 자동으로 전파
-resource "aws_vpn_gateway_route_propagation" "route_propagation" {
-  vpn_gateway_id = aws_vpn_gateway.vpc1_vgw.id
-  route_table_id = aws_route_table.vpc1_public_rt.id
-}
+# # 프라이빗 서브넷 생성
+# resource "aws_subnet" "vpc2_subnet" {
+#   vpc_id            = aws_vpc.vpc2.id
+#   cidr_block        = "10.0.1.0/24"
+#   availability_zone = "ap-northeast-2a"
 
-# ========================================
-# AWS Azure VPN 설정
-# ========================================
-# Azure VPN Gateway와 연결하는 설정 (주석 해제 후 사용)
-# # 1. Azure VPN Gateway 정보를 기반으로 Customer Gateway 생성
-# resource "aws_customer_gateway" "azure_vpn_cgw" {
-#   bgp_asn    = 65015            # Azure VPN Gateway BGP ASN
-#   ip_address = "Azure IP"   # Azure VPN Public IP
+#   tags = {
+#     Name = "VPC2-Seoul-IDC-Subnet"
+#   }
+# }
+
+# # 프라이빗 라우트 테이블 생성
+# resource "aws_route_table" "vpc2_rt" {
+#   vpc_id = aws_vpc.vpc2.id
+
+#   tags = {
+#     Name = "VPC2-IDC-RouteTable"
+#   }
+# }
+
+# resource "aws_route" "vpc2_internet_route" {
+#   route_table_id         = aws_route_table.vpc2_rt.id
+#   destination_cidr_block = "0.0.0.0/0"
+#   gateway_id             = aws_internet_gateway.vpc2_igw.id
+# }
+
+# # 서브넷과 라우트 테이블 연결
+# resource "aws_route_table_association" "vpc2_assoc" {
+#   subnet_id      = aws_subnet.vpc2_subnet.id
+#   route_table_id = aws_route_table.vpc2_rt.id
+# }
+
+# # ========================================
+# # IDC EC2 인스턴스 (VPN 장비 역할)
+# # ========================================
+
+# # 보안 그룹 생성
+# resource "aws_security_group" "vpc2_idc_sg" {
+#   name        = "vpc2-idc-sg"
+#   description = "Security group for IDC EC2"
+#   vpc_id      = aws_vpc.vpc2.id
+
+#   # VPN 트래픽 허용
+#   ingress {
+#     description = "SSH Access"
+#     from_port   = 22
+#     to_port     = 22
+#     protocol    = "tcp"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+
+#   ingress {
+#     description = "IPSec IKE"
+#     from_port   = 500
+#     to_port     = 500
+#     protocol    = "udp"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+
+#   ingress {
+#     description = "IPSec NAT-T"
+#     from_port   = 4500
+#     to_port     = 4500
+#     protocol    = "udp"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+
+#   # VPC1에서 오는 트래픽 허용
+#   ingress {
+#     description = "From VPC1"
+#     from_port   = 0
+#     to_port     = 0
+#     protocol    = "-1"
+#     cidr_blocks = ["10.1.0.0/16"]
+#   }
+
+#   # VPC2 내부 통신
+#   ingress {
+#     description = "VPC2 Internal"
+#     from_port   = 0
+#     to_port     = 0
+#     protocol    = "-1"
+#     cidr_blocks = ["10.2.0.0/16"]
+#   }
+
+#   egress {
+#     from_port   = 0
+#     to_port     = 0
+#     protocol    = "-1"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+
+#   tags = {
+#     Name = "VPC2-IDC-SecurityGroup"
+#   }
+# }
+
+# # IDC EC2 인스턴스용 EIP
+# resource "aws_eip" "idc_vpn_eip" {
+#   domain = "vpc"
+
+#   tags = {
+#     Name = "IDC-VPN-Device-EIP"
+#   }
+# }
+
+# # IDC EC2 인스턴스
+# resource "aws_instance" "idc_vpn_server" {
+#   ami           = data.aws_ami.rocky9.id
+#   instance_type = "t3.small"   # x86_64 기반
+#   subnet_id     = aws_subnet.vpc2_subnet.id
+#   private_ip                  = "10.0.1.10"
+#   key_name = data.aws_key_pair.default.key_name
+#   vpc_security_group_ids = [aws_security_group.vpc2_idc_sg.id]
+#   source_dest_check = false
+
+#   # VPN 소프트웨어 설치를 위한 초기 설정
+#     user_data = base64encode(<<-EOF
+#     #!/bin/bash
+#     hostnamectl --static set-hostname VPC2-IDC-CGW
+
+#     cat <<'EOT' > /etc/profile.d/prompt.sh
+#     export PS1="[\[\e[1;31m\]\u\[\e[m\]@\[\e[1;32m\]\h\[\e[m\]: \[\e[1;36m\]\w\[\e[m\]]#"
+#     EOT
+#     source /etc/profile
+
+#     EOF
+#   )
+
+#   tags = {
+#     Name = "VPC2-IDC-CGW"
+#   }
+# }
+
+# # IDC DB 인스턴스
+# resource "aws_instance" "idc_DB_server" {
+#   ami           = data.aws_ami.amazon_linux_2023.id
+#   instance_type = "t3.small"
+#   subnet_id     = aws_subnet.vpc2_subnet.id
+#   private_ip                  = "10.0.1.100"
+#   associate_public_ip_address = true
+#   key_name      = data.aws_key_pair.default.key_name
+#   vpc_security_group_ids = [aws_security_group.vpc2_idc_sg.id]
+#   source_dest_check      = false
+    
+#     user_data = base64encode(<<-EOF
+#     #!/bin/bash
+#     hostnamectl set-hostname VPC2-IDC-DB
+#     cat <<'EOT' > /etc/profile.d/prompt.sh
+#     export PS1="[\[\e[1;31m\]\u\[\e[m\]@\[\e[1;32m\]\h\[\e[m\]: \[\e[1;36m\]\w\[\e[m\]]#"
+#     EOT
+#     source /etc/profile
+#     EOF
+#     )
+#   tags = {
+#   Name = "VPC2-IDC-DB"
+#   }
+# }
+
+# # EIP를 EC2에 연결
+# resource "aws_eip_association" "idc_eip_assoc" {
+#   instance_id   = aws_instance.idc_vpn_server.id
+#   allocation_id = aws_eip.idc_vpn_eip.id
+# }
+
+
+# # ========================================
+# # VPC1 - AWS 클라우드 환경
+# # ========================================
+
+# # Customer Gateway (IDC 측 VPN 장비)
+# resource "aws_customer_gateway" "vpc1_cgw" {
+#   bgp_asn    = 65000
+#   ip_address = aws_eip.idc_vpn_eip.public_ip  # IDC EC2의 EIP 사용
 #   type       = "ipsec.1"
 
 #   tags = {
-#     Name = "Azure-VPN-CGW"
+#     Name = "VPC1-Seoul-CustomerGateway-IDC"
 #   }
+
+#   depends_on = [aws_eip.idc_vpn_eip]
 # }
 
-# # 2. VGW와 연결할 VPN Connection 생성
-# resource "aws_vpn_connection" "vpc1_to_azure" {
-#   vpn_gateway_id      = aws_vpn_gateway.vpc1_vgw.id
-#   customer_gateway_id = aws_customer_gateway.azure_vpn_cgw.id
-#   type                = "ipsec.1"
-  
-#   # BGP를 사용할 경우
-#   static_routes_only = false
+# # Virtual Private Gateway (VPC1에 연결)
+# resource "aws_vpn_gateway" "vpc1_vgw" {
+#   vpc_id = aws_vpc.vpc1.id
 
 #   tags = {
-#     Name = "VPC1-to-Azure-VPN"
+#     Name = "VPC1-Seoul-VirtualPrivateGateway"
 #   }
 # }
 
+# # VPN Connection
+# resource "aws_vpn_connection" "vpc1_vpn" {
+#   customer_gateway_id = aws_customer_gateway.vpc1_cgw.id
+#   vpn_gateway_id      = aws_vpn_gateway.vpc1_vgw.id
+#   type                = "ipsec.1"
+#   static_routes_only  = false
 
-# ========================================
-# Outputs
-# ========================================
+#   # Tunnel 1 설정
+#   tunnel1_preshared_key = "cloudneta"
+#   tunnel1_inside_cidr   = "169.254.159.32/30"
 
-output "idc_vpn_eip" {
-  description = "IDC VPN EC2 Elastic IP"
-  value       = aws_eip.idc_vpn_eip.public_ip
+#   # Tunnel 2 설정
+#   tunnel2_preshared_key = "cloudneta"
+#   tunnel2_inside_cidr   = "169.254.210.148/30"
+
+#   tags = {
+#     Name = "VPC1-Seoul-AWS-VPNConnection-IDC"
+#   }
+# }
+
+# # # Static Route 추가 (VPC0 대역)
+# # resource "aws_vpn_connection_route" "vpc2_route" {
+# #   destination_cidr_block = "10.0.0.0/16"
+# #   vpn_connection_id      = aws_vpn_connection.vpc1_vpn.id
+# # }
+
+# # VPC1 Route Table에서 IDC(VPC0)로 가는 라우트
+# resource "aws_route" "vpc1_to_idc" {
+#   route_table_id         = aws_route_table.vpc1_db_rt_aza.id
+#   destination_cidr_block = "10.0.0.0/16"  # VPC0(IDC) 대역
+#   gateway_id             = aws_vpn_gateway.vpc1_vgw.id
+#   depends_on             = [aws_vpn_connection.vpc1_vpn]
+# }
+
+# # VPC2 Route Table에서 VPC1으로 가는 라우트
+# resource "aws_route" "vpc2_to_vpc1" {
+#   route_table_id         = aws_route_table.vpc2_rt.id
+#   destination_cidr_block = "10.1.0.0/16"  # VPC1 대역
+#   network_interface_id   = aws_instance.idc_vpn_server.primary_network_interface_id
+#   depends_on             = [aws_instance.idc_vpn_server]
+# }
+
+# # VPN을 통해 학습한 라우트가 자동으로 전파
+# resource "aws_vpn_gateway_route_propagation" "route_propagation" {
+#   vpn_gateway_id = aws_vpn_gateway.vpc1_vgw.id
+#   route_table_id = aws_route_table.vpc1_public_rt.id
+# }
+
+# # ========================================
+# # AWS Azure VPN 설정
+# # ========================================
+# # Azure VPN Gateway와 연결하는 설정 (주석 해제 후 사용)
+# # # 1. Azure VPN Gateway 정보를 기반으로 Customer Gateway 생성
+# # resource "aws_customer_gateway" "azure_vpn_cgw" {
+# #   bgp_asn    = 65015            # Azure VPN Gateway BGP ASN
+# #   ip_address = "Azure IP"   # Azure VPN Public IP
+# #   type       = "ipsec.1"
+
+# #   tags = {
+# #     Name = "Azure-VPN-CGW"
+# #   }
+# # }
+
+# # # 2. VGW와 연결할 VPN Connection 생성
+# # resource "aws_vpn_connection" "vpc1_to_azure" {
+# #   vpn_gateway_id      = aws_vpn_gateway.vpc1_vgw.id
+# #   customer_gateway_id = aws_customer_gateway.azure_vpn_cgw.id
+# #   type                = "ipsec.1"
+  
+# #   # BGP를 사용할 경우
+# #   static_routes_only = false
+
+# #   tags = {
+# #     Name = "VPC1-to-Azure-VPN"
+# #   }
+# # }
+
+
+# # ========================================
+# # Outputs
+# # ========================================
+
+# output "idc_vpn_eip" {
+#   description = "IDC VPN EC2 Elastic IP"
+#   value       = aws_eip.idc_vpn_eip.public_ip
+# }
+
+# output "idc_ec2_private_ip" {
+#   description = "IDC EC2 Private IP"
+#   value       = aws_instance.idc_vpn_server.private_ip
+# }
+
+# output "vpn_connection_id" {
+#   description = "VPN Connection ID"
+#   value       = aws_vpn_connection.vpc1_vpn.id
+# }
+
+# output "vpn_tunnel1_address" {
+#   description = "VPN Tunnel 1 AWS endpoint"
+#   value       = aws_vpn_connection.vpc1_vpn.tunnel1_address
+# }
+
+# output "vpn_tunnel2_address" {
+#   description = "VPN Tunnel 2 AWS endpoint"
+#   value       = aws_vpn_connection.vpc1_vpn.tunnel2_address
+# }
+
+# output "vpn_configuration" {
+#   description = "VPN Configuration for IDC EC2"
+#   value = {
+#     tunnel1_address           = aws_vpn_connection.vpc1_vpn.tunnel1_address
+#     tunnel1_preshared_key     = "cloudneta"
+#     tunnel1_inside_cidr       = "169.254.159.32/30"
+#     tunnel1_cgw_inside_ip     = aws_vpn_connection.vpc1_vpn.tunnel1_cgw_inside_address
+#     tunnel1_vgw_inside_ip     = aws_vpn_connection.vpc1_vpn.tunnel1_vgw_inside_address
+#     tunnel2_address           = aws_vpn_connection.vpc1_vpn.tunnel2_address
+#     tunnel2_preshared_key     = "cloudneta"
+#     tunnel2_inside_cidr       = "169.254.210.148/30"
+#     tunnel2_cgw_inside_ip     = aws_vpn_connection.vpc1_vpn.tunnel2_cgw_inside_address
+#     tunnel2_vgw_inside_ip     = aws_vpn_connection.vpc1_vpn.tunnel2_vgw_inside_address
+#   }
+#   sensitive = true
+# }
+
+output "aurora_cluster_endpoint" {
+  description = "Aurora cluster endpoint"
+  value       = aws_rds_cluster.aurora_cluster.endpoint
 }
 
-output "idc_ec2_private_ip" {
-  description = "IDC EC2 Private IP"
-  value       = aws_instance.idc_vpn_server.private_ip
+output "aurora_reader_endpoint" {
+  description = "Aurora reader endpoint"
+  value       = aws_rds_cluster.aurora_cluster.reader_endpoint
 }
 
-output "vpn_connection_id" {
-  description = "VPN Connection ID"
-  value       = aws_vpn_connection.vpc1_vpn.id
-}
-
-output "vpn_tunnel1_address" {
-  description = "VPN Tunnel 1 AWS endpoint"
-  value       = aws_vpn_connection.vpc1_vpn.tunnel1_address
-}
-
-output "vpn_tunnel2_address" {
-  description = "VPN Tunnel 2 AWS endpoint"
-  value       = aws_vpn_connection.vpc1_vpn.tunnel2_address
-}
-
-output "vpn_configuration" {
-  description = "VPN Configuration for IDC EC2"
+output "aurora_log_groups" {
+  description = "Aurora CloudWatch Log Groups"
   value = {
-    tunnel1_address           = aws_vpn_connection.vpc1_vpn.tunnel1_address
-    tunnel1_preshared_key     = "cloudneta"
-    tunnel1_inside_cidr       = "169.254.159.32/30"
-    tunnel1_cgw_inside_ip     = aws_vpn_connection.vpc1_vpn.tunnel1_cgw_inside_address
-    tunnel1_vgw_inside_ip     = aws_vpn_connection.vpc1_vpn.tunnel1_vgw_inside_address
-    tunnel2_address           = aws_vpn_connection.vpc1_vpn.tunnel2_address
-    tunnel2_preshared_key     = "cloudneta"
-    tunnel2_inside_cidr       = "169.254.210.148/30"
-    tunnel2_cgw_inside_ip     = aws_vpn_connection.vpc1_vpn.tunnel2_cgw_inside_address
-    tunnel2_vgw_inside_ip     = aws_vpn_connection.vpc1_vpn.tunnel2_vgw_inside_address
+    error     = aws_cloudwatch_log_group.aurora_error.name
+    slowquery = aws_cloudwatch_log_group.aurora_slowquery.name
   }
-  sensitive = true
 }
