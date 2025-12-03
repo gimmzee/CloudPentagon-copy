@@ -579,6 +579,13 @@ resource "aws_lb" "public_alb" {
   enable_deletion_protection = false
   enable_http2              = true
 
+  # ⭐ 이 블록만 추가!
+  access_logs {
+    bucket  = aws_s3_bucket.alb_logs.id
+    prefix  = "alb-public"
+    enabled = true
+  }
+
   tags = {
     Name = "VPC1-Public-ALB"
     Tier = "Public"
@@ -634,6 +641,13 @@ resource "aws_lb" "internal_alb" {
 
   enable_deletion_protection = false
   enable_http2              = true
+
+  # ⭐ 
+  access_logs {
+    bucket  = aws_s3_bucket.alb_logs.id
+    prefix  = "alb-internal"
+    enabled = true
+  }
 
   tags = {
     Name = "VPC1-Internal-ALB"
@@ -1076,7 +1090,7 @@ resource "aws_ecs_task_definition" "backend" {
       },
             {
         name  = "DB_URL"  
-        value = "jdbc:mysql://DB명 입력:3306/social_network?useSSL=false&createDatabaseIfNotExist=true&serverTimezone=UTC" 
+        value = "jdbc:mysql://cloudpentagon-cluster.cluster-cvmii84a4m63.ap-northeast-2.rds.amazonaws.com:3306/social_network?useSSL=false&createDatabaseIfNotExist=true&serverTimezone=UTC" 
       },
             {
         name  = "DB_USERNAME"  
@@ -1239,7 +1253,7 @@ resource "aws_appautoscaling_policy" "backend_cpu" {
 # ========================================
 # AWS Secrets Manager
 resource "aws_secretsmanager_secret" "aws_db_secret" {
-  name        = "db-credentials-dev-v2"
+  name        = "db-credentials-dev-v5"
   description = "Credentials for Aurora MySQL"
 }
 
@@ -2167,12 +2181,4 @@ output "aurora_cluster_endpoint" {
 output "aurora_reader_endpoint" {
   description = "Aurora reader endpoint"
   value       = aws_rds_cluster.aurora_cluster.reader_endpoint
-}
-
-output "aurora_log_groups" {
-  description = "Aurora CloudWatch Log Groups"
-  value = {
-    error     = aws_cloudwatch_log_group.aurora_error.name
-    slowquery = aws_cloudwatch_log_group.aurora_slowquery.name
-  }
 }

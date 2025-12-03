@@ -1,19 +1,34 @@
 # ========================================
-# 중앙 로그 시스템 - OpenSearch & CloudWatch Logs
+# 중앙 로그 시스템 - Kinesis Firehose 통합 아키텍처
 # ========================================
-# 730, 762 변경 필요
-# ========================================
-# 1. CloudWatch Log Groups (각 서비스별)
+# 
+# 아키텍처 개요:
+# 1. 로그 수집: CloudWatch Logs → Firehose → [Transform Lambda] → OpenSearch → S3 Backup
+# 2. 알람 시스템: CloudWatch Logs → Metric Filter → CloudWatch Alarm → SNS → Slack Lambda → Slack
+#
+# 로그 타입별 Firehose 스트림:
+# 1. Application Logs (ECS, RDS)
+# 2. Access Logs (ALB)
+# 3. Infrastructure Logs (VPC Flow Logs)
+# 4. Audit Logs (CloudTrail)
 # ========================================
 
-# ECS 애플리케이션 로그 그룹
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+# ========================================
+# 1. CloudWatch Log Groups
+# ========================================
+
+# Application Logs
 resource "aws_cloudwatch_log_group" "ecs_frontend" {
   name              = "/aws/ecs/${var.project_name}/frontend"
-  retention_in_days = 7  # 비용 절감을 위해 7일
+  retention_in_days = 7 # 비용 절감을 위해 7일
 
   tags = {
     Name        = "ECS-Frontend-Logs"
     Environment = var.environment
+    LogType     = "application"
   }
 }
 
@@ -24,66 +39,228 @@ resource "aws_cloudwatch_log_group" "ecs_backend" {
   tags = {
     Name        = "ECS-Backend-Logs"
     Environment = var.environment
-  }
-}
-
-# ALB 액세스 로그 그룹
-resource "aws_cloudwatch_log_group" "alb_public" {
-  name              = "/aws/alb/${var.project_name}/public"
-  retention_in_days = 3  # ALB 로그는 많으므로 3일
-
-  tags = {
-    Name        = "ALB-Public-Logs"
-    Environment = var.environment
-  }
-}
-
-resource "aws_cloudwatch_log_group" "alb_internal" {
-  name              = "/aws/alb/${var.project_name}/internal"
-  retention_in_days = 3
-
-  tags = {
-    Name        = "ALB-Internal-Logs"
-    Environment = var.environment
+    LogType     = "application"
   }
 }
 
 # RDS 로그 그룹 (자동 생성되지만 명시적으로 관리)
 resource "aws_cloudwatch_log_group" "aurora_error" {
-  name              = "/aws/rds/cluster/cloudpentagon-cluster/error"
+  name              = "/aws/rds/cluster/${var.project_name}-cluster/error"
   retention_in_days = 7
 
   tags = {
-    Name        = "RDS-Error-Logs"
+    Name        = "Aurora-Error-Logs"
     Environment = var.environment
+    LogType     = "application"
   }
 }
 
+# 🔧 FIX 1: Aurora SlowQuery 로그 그룹 - 기존 리소스 import 필요
+# 이미 Aurora에 의해 자동 생성된 로그 그룹을 import해야 합니다
+# 터미널에서 실행:
+# terraform import aws_cloudwatch_log_group.aurora_slowquery /aws/rds/cluster/cloudpentagon-cluster/slowquery
 resource "aws_cloudwatch_log_group" "aurora_slowquery" {
-  name              = "/aws/rds/cluster/cloudpentagon-cluster/slowquery"
+  name              = "/aws/rds/cluster/${var.project_name}-cluster/slowquery"
   retention_in_days = 7
 
   tags = {
-    Name        = "RDS-SlowQuery-Logs"
+    Name        = "Aurora-SlowQuery-Logs"
     Environment = var.environment
+    LogType     = "application"
   }
 }
 
-# VPC Flow Logs 그룹
+# Infrastructure Logs
 resource "aws_cloudwatch_log_group" "vpc_flow_logs" {
   name              = "/aws/vpc/${var.project_name}/flowlogs"
-  retention_in_days = 3  # Flow 로그는 많으므로 3일
+  retention_in_days = 3 # Flow 로그는 많으므로 3일
 
   tags = {
     Name        = "VPC-FlowLogs"
     Environment = var.environment
+    LogType     = "infrastructure"
   }
 }
 
-# CloudTrail 로그 그룹
+# Audit Logs
 resource "aws_cloudwatch_log_group" "cloudtrail" {
   name              = "/aws/cloudtrail/${var.project_name}"
-  retention_in_days = 30  # 감사 로그는 30일 보관
+  retention_in_days = 30  # 감사 로그는 장기 보관
+
+  tags = {
+    Name        = "CloudTrail-Logs"
+    Environment = var.environment
+    LogType     = "audit"
+  }
+}
+
+# Firehose Log Groups
+resource "aws_cloudwatch_log_group" "firehose_application" {
+  name              = "/aws/kinesisfirehose/${var.project_name}-application"
+  retention_in_days = 7
+  
+  tags = {
+    Name        = "Firehose-Application-Logs"
+    Environment = var.environment
+    LogType     = "firehose"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "firehose_infrastructure" {
+  name              = "/aws/kinesisfirehose/${var.project_name}-infrastructure"
+  retention_in_days = 7
+  
+  tags = {
+    Name        = "Firehose-Infrastructure-Logs"
+    Environment = var.environment
+    LogType     = "firehose"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "firehose_audit" {
+  name              = "/aws/kinesisfirehose/${var.project_name}-audit"
+  retention_in_days = 7
+  
+  tags = {
+    Name        = "Firehose-Audit-Logs"
+    Environment = var.environment
+    LogType     = "firehose"
+  }
+}
+
+resource "aws_cloudwatch_log_group" "firehose_access" {
+  name              = "/aws/kinesisfirehose/${var.project_name}-access"
+  retention_in_days = 7
+  
+  tags = {
+    Name        = "Firehose-Access-Logs"
+    Environment = var.environment
+    LogType     = "firehose"
+  }
+}
+
+# ========================================
+# 2. S3 Buckets for Backup & Source
+# ========================================
+
+# Unified Backup Bucket
+resource "aws_s3_bucket" "logs_backup" {
+  bucket = "${var.project_name}-logs-backup-${data.aws_caller_identity.current.account_id}"
+
+  tags = {
+    Name        = "Centralized-Logs-Backup"
+    Environment = var.environment
+  }
+}
+
+resource "aws_s3_bucket_versioning" "logs_backup" {
+  bucket = aws_s3_bucket.logs_backup.id
+
+  versioning_configuration {
+    status = "Disabled"
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "logs_backup" {
+  bucket = aws_s3_bucket.logs_backup.id
+
+  # 1. Application Logs (ECS, RDS)
+  rule {
+    id     = "application-logs-lifecycle"
+    status = "Enabled"
+    filter { prefix = "application-logs/" }
+    
+    expiration { days = 7 }
+  }
+
+  # 2. Access Logs (ALB)
+  rule {
+    id     = "access-logs-lifecycle"
+    status = "Enabled"
+    filter { prefix = "access-logs/" }
+    
+    expiration { days = 14 }
+  }
+
+  # 3. Infrastructure Logs (VPC)
+  rule {
+    id     = "infrastructure-logs-lifecycle"
+    status = "Enabled"
+    filter { prefix = "infrastructure-logs/" }
+    
+    expiration { days = 3 }
+  }
+
+  # 4. Audit Logs (CloudTrail) - 장기 보관
+  rule {
+    id     = "audit-logs-lifecycle"
+    status = "Enabled"
+    filter { prefix = "audit-logs/" }
+    
+    transition {
+      days          = 30
+      storage_class = "GLACIER"
+    }
+    
+    expiration { days = 90 }
+  }
+}
+
+# ALB Access Logs Bucket (ALB는 S3 직접 전송)
+resource "aws_s3_bucket" "alb_logs" {
+  bucket = "${var.project_name}-alb-logs-${data.aws_caller_identity.current.account_id}"
+
+  tags = {
+    Name        = "ALB-Access-Logs"
+    Environment = var.environment
+  }
+}
+
+resource "aws_s3_bucket_policy" "alb_logs" {
+  bucket = aws_s3_bucket.alb_logs.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AWSLogDeliveryWrite"
+        Effect = "Allow"
+        Principal = {
+          Service = "delivery.logs.amazonaws.com"
+        }
+        Action   = "s3:PutObject"
+        Resource = "${aws_s3_bucket.alb_logs.arn}/*"
+        Condition = {
+          StringEquals = {
+            "s3:x-amz-acl" = "bucket-owner-full-control"
+          }
+        }
+      },
+      {
+        Sid    = "AWSLogDeliveryAclCheck"
+        Effect = "Allow"
+        Principal = {
+          Service = "delivery.logs.amazonaws.com"
+        }
+        Action   = "s3:GetBucketAcl"
+        Resource = aws_s3_bucket.alb_logs.arn
+      },
+      {
+        Sid    = "AWSELBLogDelivery"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::600734575887:root"  # ap-northeast-2 ELB account
+        }
+        Action   = "s3:PutObject"
+        Resource = "${aws_s3_bucket.alb_logs.arn}/*"
+      }
+    ]
+  })
+}
+
+# CloudTrail S3 Bucket
+resource "aws_s3_bucket" "cloudtrail" {
+  bucket = "${var.project_name}-cloudtrail-${data.aws_caller_identity.current.account_id}"
 
   tags = {
     Name        = "CloudTrail-Logs"
@@ -91,113 +268,6 @@ resource "aws_cloudwatch_log_group" "cloudtrail" {
   }
 }
 
-# Lambda 로그 그룹들 (기존 Lambda 함수들)
-resource "aws_cloudwatch_log_group" "lambda_notification" {
-  name              = "/aws/lambda/${var.project_name}-notification-lambda"
-  retention_in_days = 7
-
-  tags = {
-    Name        = "Lambda-Notification-Logs"
-    Environment = var.environment
-  }
-}
-
-# 인프라 로그 그룹 (syslog용 - EC2나 인프라 컴포넌트)
-resource "aws_cloudwatch_log_group" "infrastructure" {
-  name              = "/aws/infrastructure/${var.project_name}/syslog"
-  retention_in_days = 7
-
-  tags = {
-    Name        = "Infrastructure-Syslog"
-    Environment = var.environment
-  }
-}
-
-# ========================================
-# 2. VPC Flow Logs 활성화
-# ========================================
-
-resource "aws_flow_log" "vpc1_flow_log" {
-  vpc_id          = aws_vpc.vpc1.id
-  traffic_type    = "ALL"  # ACCEPT, REJECT, ALL
-  iam_role_arn    = aws_iam_role.vpc_flow_logs_role.arn
-  log_destination = aws_cloudwatch_log_group.vpc_flow_logs.arn
-
-  tags = {
-    Name        = "VPC1-FlowLogs"
-    Environment = var.environment
-  }
-}
-
-# VPC Flow Logs IAM Role
-resource "aws_iam_role" "vpc_flow_logs_role" {
-  name = "${var.project_name}-vpc-flow-logs-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "vpc-flow-logs.amazonaws.com"
-        }
-      }
-    ]
-  })
-
-  tags = {
-    Name        = "VPC-FlowLogs-Role"
-    Environment = var.environment
-  }
-}
-
-resource "aws_iam_role_policy" "vpc_flow_logs_policy" {
-  name = "${var.project_name}-vpc-flow-logs-policy"
-  role = aws_iam_role.vpc_flow_logs_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents",
-          "logs:DescribeLogGroups",
-          "logs:DescribeLogStreams"
-        ]
-        Effect   = "Allow"
-        Resource = "*"
-      }
-    ]
-  })
-}
-
-# ========================================
-# 3. CloudTrail 설정
-# ========================================
-
-# CloudTrail S3 버킷 (필수)
-resource "aws_s3_bucket" "cloudtrail" {
-  bucket = "${var.project_name}-cloudtrail-logs-${data.aws_caller_identity.current.account_id}"
-
-  tags = {
-    Name        = "CloudTrail-Logs-Bucket"
-    Environment = var.environment
-  }
-}
-
-resource "aws_s3_bucket_public_access_block" "cloudtrail" {
-  bucket = aws_s3_bucket.cloudtrail.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# CloudTrail S3 버킷 정책
 resource "aws_s3_bucket_policy" "cloudtrail" {
   bucket = aws_s3_bucket.cloudtrail.id
 
@@ -231,103 +301,14 @@ resource "aws_s3_bucket_policy" "cloudtrail" {
   })
 }
 
-# CloudTrail IAM Role for CloudWatch Logs
-resource "aws_iam_role" "cloudtrail_cloudwatch_role" {
-  name = "${var.project_name}-cloudtrail-cloudwatch-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "cloudtrail.amazonaws.com"
-        }
-      }
-    ]
-  })
-
-  tags = {
-    Name        = "CloudTrail-CloudWatch-Role"
-    Environment = var.environment
-  }
-}
-
-resource "aws_iam_role_policy" "cloudtrail_cloudwatch_policy" {
-  name = "${var.project_name}-cloudtrail-cloudwatch-policy"
-  role = aws_iam_role.cloudtrail_cloudwatch_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "AWSCloudTrailCreateLogStream"
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ]
-        Resource = "${aws_cloudwatch_log_group.cloudtrail.arn}:*"
-      }
-    ]
-  })
-}
-
-# CloudTrail
-resource "aws_cloudtrail" "main" {
-  name                          = "${var.project_name}-trail"
-  s3_bucket_name                = aws_s3_bucket.cloudtrail.id
-  include_global_service_events = true
-  is_multi_region_trail         = false
-  enable_log_file_validation    = true
-
-  # CloudWatch Logs 통합
-  cloud_watch_logs_group_arn = "${aws_cloudwatch_log_group.cloudtrail.arn}:*"
-  cloud_watch_logs_role_arn  = aws_iam_role.cloudtrail_cloudwatch_role.arn
-
-  event_selector {
-    read_write_type           = "All"
-    include_management_events = true
-
-    data_resource {
-      type   = "AWS::S3::Object"
-      values = ["arn:aws:s3:::"]
-    }
-  }
-
-  depends_on = [aws_s3_bucket_policy.cloudtrail]
-
-  tags = {
-    Name        = "Main-CloudTrail"
-    Environment = var.environment
-  }
-}
-
 # ========================================
-# 4. OpenSearch Domain (비용 최적화 버전)
+# 3. OpenSearch Domain
 # ========================================
 
-# OpenSearch용 보안 그룹
 resource "aws_security_group" "opensearch" {
   name        = "${var.project_name}-opensearch-sg"
-  description = "Security group for OpenSearch domain"
+  description = "Security group for OpenSearch"
   vpc_id      = aws_vpc.vpc1.id
-
-  ingress {
-    description = "HTTPS from VPC"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = [aws_vpc.vpc1.cidr_block]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
 
   tags = {
     Name        = "OpenSearch-SecurityGroup"
@@ -335,61 +316,82 @@ resource "aws_security_group" "opensearch" {
   }
 }
 
-# # OpenSearch Service-Linked Role 생성
-# resource "aws_iam_service_linked_role" "opensearch" {
-#   aws_service_name = "es.amazonaws.com"
-#   description      = "Service-linked role for Amazon OpenSearch Service"
+resource "aws_security_group" "firehose" {
+  name        = "${var.project_name}-firehose-sg"
+  description = "Security group for Firehose ENIs"
+  vpc_id      = aws_vpc.vpc1.id
 
-#   # 이미 존재할 수 있으므로 lifecycle 추가
-#   lifecycle {
-#     ignore_changes = [
-#       aws_service_name,
-#       description
-#     ]
-#   }
-# }
+  egress {
+    description = "HTTPS to OpenSearch"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    security_groups = [aws_security_group.opensearch.id]
+  }
+  
+  egress {
+    description = "All outbound"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
 
-# OpenSearch Domain (비용 최적화: 단일 노드)
+  tags = {
+    Name        = "Firehose-SecurityGroup"
+    Environment = var.environment
+  }
+}
+
+# OpenSearch: Firehose로부터의 접근 허용
+resource "aws_security_group_rule" "opensearch_from_firehose" {
+  type                     = "ingress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  security_group_id        = aws_security_group.opensearch.id
+  source_security_group_id = aws_security_group.firehose.id
+  description              = "HTTPS from Firehose"
+}
+
 resource "aws_opensearch_domain" "logs" {
-  # depends_on = [aws_iam_service_linked_role.opensearch]
   domain_name    = "${var.project_name}-logs"
   engine_version = "OpenSearch_2.11"
 
   cluster_config {
-    instance_type  = "t3.small.search"  # 가장 저렴한 옵션
-    instance_count = 1                  # 단일 노드 (개발/학습용)
-    
-    # 프로덕션에서는 다음을 활성화:
-    # instance_count = 2
-    # zone_awareness_enabled = true
-    # zone_awareness_config {
-    #   availability_zone_count = 2
-    # }
+    instance_type            = "t3.small.search"
+    instance_count           = 2
+    zone_awareness_enabled   = true
+
+    zone_awareness_config {
+      availability_zone_count = 2
+    }    
+  }
+
+  vpc_options {
+    subnet_ids = [
+      aws_subnet.vpc1_ecs_backend_aza.id,
+      aws_subnet.vpc1_ecs_backend_azc.id
+    ]
+    security_group_ids = [aws_security_group.opensearch.id]
   }
 
   ebs_options {
     ebs_enabled = true
-    volume_size = 10  # 10GB (최소)
+    volume_size = 20
     volume_type = "gp3"
   }
 
-  # VPC 내부 배치
-  vpc_options {
-    subnet_ids         = [aws_subnet.vpc1_ecs_backend_aza.id]
-    security_group_ids = [aws_security_group.opensearch.id]
-  }
-
-  # 액세스 정책
   access_policies = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
         Effect = "Allow"
         Principal = {
-          AWS = "*"  # 모두 허용
+          AWS = "*"
         }
         Action   = "es:*"
-        Resource = "arn:aws:es:ap-northeast-2:${data.aws_caller_identity.current.account_id}:domain/${var.project_name}-logs/*"
+        Resource = "arn:aws:es:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:domain/${var.project_name}-logs/*"
       }
     ]
   })
@@ -412,47 +414,54 @@ resource "aws_opensearch_domain" "logs" {
     internal_user_database_enabled = true
     master_user_options {
       master_user_name     = "admin"
-      master_user_password = "Admin123!" # 실제로는 AWS Secrets Manager 사용 권장
+      master_user_password = "Admin123!@#"  # 실제로는 Secrets Manager 사용
     }
   }
 
   tags = {
-    Name        = "OpenSearch-Logs-Domain"
+    Name        = "Centralized-Logs-OpenSearch"
     Environment = var.environment
   }
 }
 
 # ========================================
-# 5. Lambda - CloudWatch Logs to OpenSearch
+# 4. Firehose Transform Lambda
 # ========================================
 
+# Lambda용 로그 그룹
+resource "aws_cloudwatch_log_group" "firehose_transform_lambda" {
+  name              = "/aws/lambda/${var.project_name}-firehose-transform"
+  retention_in_days = 7
+
+  tags = {
+    Name        = "Firehose-Transform-Lambda-Logs"
+    Environment = var.environment
+  }
+}
+
 # Lambda IAM Role
-resource "aws_iam_role" "logs_to_opensearch_lambda" {
-  name = "${var.project_name}-logs-to-opensearch-role"
+resource "aws_iam_role" "firehose_transform_lambda" {
+  name = "${var.project_name}-firehose-transform-lambda-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "lambda.amazonaws.com"
       }
-    ]
+      Action = "sts:AssumeRole"
+    }]
   })
 
   tags = {
-    Name        = "LogsToOpenSearch-Lambda-Role"
-    Environment = var.environment
+    Name = "Firehose-Transform-Lambda-Role"
   }
 }
 
-# Lambda IAM Policy
-resource "aws_iam_role_policy" "logs_to_opensearch_policy" {
-  name = "${var.project_name}-logs-to-opensearch-policy"
-  role = aws_iam_role.logs_to_opensearch_lambda.id
+resource "aws_iam_role_policy" "firehose_transform_lambda" {
+  name = "${var.project_name}-firehose-transform-lambda-policy"
+  role = aws_iam_role.firehose_transform_lambda.id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -460,270 +469,1341 @@ resource "aws_iam_role_policy" "logs_to_opensearch_policy" {
       {
         Effect = "Allow"
         Action = [
-          "logs:CreateLogGroup",
           "logs:CreateLogStream",
           "logs:PutLogEvents"
         ]
-        Resource = "arn:aws:logs:*:*:*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "es:ESHttpPost",
-          "es:ESHttpPut"
-        ]
-        Resource = "${aws_opensearch_domain.logs.arn}/*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "ec2:CreateNetworkInterface",
-          "ec2:DescribeNetworkInterfaces",
-          "ec2:DeleteNetworkInterface"
-        ]
-        Resource = "*"
+        Resource = "${aws_cloudwatch_log_group.firehose_transform_lambda.arn}:*"
       }
     ]
   })
 }
 
-# Lambda Function
-resource "aws_lambda_function" "logs_to_opensearch" {
-  filename      = "${path.module}/lambda_logs_to_opensearch/logs_to_opensearch.zip"  # 별도로 생성 필요
-  function_name = "${var.project_name}-logs-to-opensearch"
-  role          = aws_iam_role.logs_to_opensearch_lambda.arn
-  handler       = "index.handler"
-  runtime       = "python3.11"
-  timeout       = 60
-  memory_size   = 256
+# Lambda 함수 코드
+data "archive_file" "firehose_transform" {
+  type        = "zip"
+  output_path = "${path.module}/lambda/firehose_transform.zip"
 
-  vpc_config {
-    subnet_ids         = [aws_subnet.vpc1_ecs_backend_aza.id]
-    security_group_ids = [aws_security_group.opensearch.id]
-  }
+  source {
+    content  = <<-EOF
+import base64
+import gzip
+import json
 
-  environment {
-    variables = {
-      OPENSEARCH_ENDPOINT = aws_opensearch_domain.logs.endpoint
-      OPENSEARCH_INDEX    = "aws-logs"
-    }
+def lambda_handler(event, context):
+    output = []
+    
+    for record in event['records']:
+        record_id = record['recordId']
+        
+        try:
+            payload = base64.b64decode(record['data'])
+            
+            try:
+                payload = gzip.decompress(payload)
+            except:
+                pass
+            
+            log_data = json.loads(payload)
+            
+            # Control message 무시
+            if log_data.get('messageType') == 'CONTROL_MESSAGE':
+                output.append({
+                    'recordId': record_id,
+                    'result': 'Dropped',
+                    'data': record['data']
+                })
+                continue
+            
+            if 'logEvents' in log_data and log_data['logEvents']:
+                # 첫 번째 이벤트만 사용하거나, 배치로 묶음
+                first_event = log_data['logEvents'][0]
+                
+                document = {
+                    '@timestamp': first_event.get('timestamp'),
+                    'timestamp': first_event.get('timestamp'),
+                    'message': first_event.get('message', ''),
+                    'logGroup': log_data.get('logGroup', ''),
+                    'logStream': log_data.get('logStream', ''),
+                    'owner': log_data.get('owner', ''),
+                    'messageType': log_data.get('messageType', ''),
+                    'eventCount': len(log_data['logEvents'])
+                }
+                
+                # 여러 이벤트가 있으면 messages 배열에 저장
+                if len(log_data['logEvents']) > 1:
+                    document['allMessages'] = [e.get('message', '') for e in log_data['logEvents']]
+                
+                try:
+                    msg = json.loads(first_event.get('message', ''))
+                    if isinstance(msg, dict):
+                        document['parsed'] = msg
+                except:
+                    pass
+                
+                # 핵심: 단일 JSON 문서 + newline (Firehose OpenSearch 요구사항)
+                result_data = json.dumps(document) + '\n'
+                
+                output.append({
+                    'recordId': record_id,
+                    'result': 'Ok',
+                    'data': base64.b64encode(result_data.encode('utf-8')).decode('utf-8')
+                })
+            else:
+                output.append({
+                    'recordId': record_id,
+                    'result': 'Dropped',
+                    'data': record['data']
+                })
+                
+        except Exception as e:
+            output.append({
+                'recordId': record_id,
+                'result': 'ProcessingFailed',
+                'data': record['data']
+            })
+    
+    return {'records': output}
+EOF
+    filename = "index.py"
   }
+}
+
+resource "aws_lambda_function" "firehose_transform" {
+  filename         = data.archive_file.firehose_transform.output_path
+  function_name    = "${var.project_name}-firehose-transform"
+  role             = aws_iam_role.firehose_transform_lambda.arn
+  handler          = "index.lambda_handler"
+  runtime          = "python3.12"
+  timeout          = 60
+  memory_size      = 256
+  source_code_hash = data.archive_file.firehose_transform.output_base64sha256
+
+  depends_on = [aws_cloudwatch_log_group.firehose_transform_lambda]
 
   tags = {
-    Name        = "LogsToOpenSearch-Lambda"
+    Name        = "Firehose-Transform-Lambda"
     Environment = var.environment
   }
 }
 
 # ========================================
-# 6. CloudWatch Logs Subscription Filters
+# 5. Kinesis Firehose - Application Logs
 # ========================================
 
-# Aurora Error 로그 구독
-resource "aws_cloudwatch_log_subscription_filter" "aurora_error_to_opensearch" {
-  name            = "aurora-error-to-opensearch"
-  log_group_name  = aws_cloudwatch_log_group.aurora_error.name
-  filter_pattern  = ""
-  destination_arn = aws_lambda_function.logs_to_opensearch.arn
-  depends_on      = [aws_lambda_permission.aurora_error_allow_cloudwatch]
+resource "aws_iam_role" "firehose_application" {
+  name = "${var.project_name}-firehose-application-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "firehose.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+
+  tags = {
+    Name = "Firehose-Application-Role"
+  }
 }
 
-resource "aws_lambda_permission" "aurora_error_allow_cloudwatch" {
-  statement_id  = "AllowExecutionFromCloudWatchAuroraError"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.logs_to_opensearch.function_name
-  principal     = "logs.amazonaws.com"
-  source_arn    = "${aws_cloudwatch_log_group.aurora_error.arn}:*"
+resource "aws_iam_role_policy" "firehose_application" {
+  name = "${var.project_name}-firehose-application-policy"
+  role = aws_iam_role.firehose_application.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "es:DescribeElasticsearchDomain",
+          "es:DescribeElasticsearchDomains",
+          "es:DescribeElasticsearchDomainConfig",
+          "es:ESHttpHead",
+          "es:ESHttpPost",
+          "es:ESHttpPut",
+          "es:ESHttpGet"
+        ]
+        Resource = [
+          "${aws_opensearch_domain.logs.arn}",
+          "${aws_opensearch_domain.logs.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:AbortMultipartUpload",
+          "s3:GetBucketLocation",
+          "s3:GetObject",
+          "s3:ListBucket",
+          "s3:ListBucketMultipartUploads",
+          "s3:PutObject"
+        ]
+        Resource = [
+          "${aws_s3_bucket.logs_backup.arn}",
+          "${aws_s3_bucket.logs_backup.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = [
+          "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/kinesisfirehose/*",
+          "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/kinesisfirehose/*:log-stream:*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeVpcs",
+          "ec2:DescribeVpcAttribute",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:CreateNetworkInterface",
+          "ec2:CreateNetworkInterfacePermission",
+          "ec2:DeleteNetworkInterface"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:InvokeFunction",
+          "lambda:GetFunctionConfiguration"
+        ]
+        Resource = "${aws_lambda_function.firehose_transform.arn}:*"
+      }
+    ]
+  })
 }
 
-# Aurora SlowQuery 로그 구독
-resource "aws_cloudwatch_log_subscription_filter" "aurora_slowquery_to_opensearch" {
-  name            = "aurora-slowquery-to-opensearch"
-  log_group_name  = aws_cloudwatch_log_group.aurora_slowquery.name
-  filter_pattern  = ""
-  destination_arn = aws_lambda_function.logs_to_opensearch.arn
-  depends_on      = [aws_lambda_permission.aurora_slowquery_allow_cloudwatch]
-}
+resource "aws_kinesis_firehose_delivery_stream" "application_logs" {
+  name        = "${var.project_name}-application-logs"
+  destination = "opensearch"
 
-resource "aws_lambda_permission" "aurora_slowquery_allow_cloudwatch" {
-  statement_id  = "AllowExecutionFromCloudWatchAuroraSlowQuery"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.logs_to_opensearch.function_name
-  principal     = "logs.amazonaws.com"
-  source_arn    = "${aws_cloudwatch_log_group.aurora_slowquery.arn}:*"
-}
+  opensearch_configuration {
+    domain_arn = aws_opensearch_domain.logs.arn
+    role_arn   = aws_iam_role.firehose_application.arn
+    index_name = "app-logs"
+    
+    index_rotation_period = "OneDay"
+    
+    buffering_interval = 60
+    buffering_size     = 5
+    
+    retry_duration = 300
+    
+    s3_backup_mode = "AllDocuments"
+    
+    s3_configuration {
+      role_arn           = aws_iam_role.firehose_application.arn
+      bucket_arn         = aws_s3_bucket.logs_backup.arn
+      prefix             = "application-logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+      error_output_prefix = "application-logs-errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+      compression_format = "GZIP"
+    }
+    
+    vpc_config {
+      subnet_ids = [
+        aws_subnet.vpc1_ecs_backend_aza.id,
+        aws_subnet.vpc1_ecs_backend_azc.id
+      ]
+      security_group_ids = [aws_security_group.firehose.id]
+      role_arn           = aws_iam_role.firehose_application.arn
+    }
+    
+    # Transform Lambda 설정 추가
+    processing_configuration {
+      enabled = true
 
-# ECS Frontend 로그 구독
-resource "aws_cloudwatch_log_subscription_filter" "ecs_frontend_to_opensearch" {
-  name            = "ecs-frontend-to-opensearch"
-  log_group_name  = aws_cloudwatch_log_group.ecs_frontend.name
-  filter_pattern  = ""
-  destination_arn = aws_lambda_function.logs_to_opensearch.arn
-  depends_on      = [aws_lambda_permission.ecs_frontend_allow_cloudwatch]
-}
+      processors {
+        type = "Lambda"
 
-resource "aws_lambda_permission" "ecs_frontend_allow_cloudwatch" {
-  statement_id  = "AllowExecutionFromCloudWatchECSFrontend"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.logs_to_opensearch.function_name
-  principal     = "logs.amazonaws.com"
-  source_arn    = "${aws_cloudwatch_log_group.ecs_frontend.arn}:*"
-}
+        parameters {
+          parameter_name  = "LambdaArn"
+          parameter_value = "${aws_lambda_function.firehose_transform.arn}:$LATEST"
+        }
+        
+        parameters {
+          parameter_name  = "BufferSizeInMBs"
+          parameter_value = "1"
+        }
+        
+        parameters {
+          parameter_name  = "BufferIntervalInSeconds"
+          parameter_value = "60"
+        }
+      }
+    }
+    
+    cloudwatch_logging_options {
+      enabled         = true
+      log_group_name  = aws_cloudwatch_log_group.firehose_application.name
+      log_stream_name = "opensearch-delivery"
+    }
+  }
+  
+  depends_on = [
+    aws_iam_role_policy.firehose_application,
+    aws_cloudwatch_log_group.firehose_application,
+    aws_lambda_function.firehose_transform
+  ]
 
-# ECS Backend 로그 구독
-resource "aws_cloudwatch_log_subscription_filter" "ecs_backend_to_opensearch" {
-  name            = "ecs-backend-to-opensearch"
-  log_group_name  = aws_cloudwatch_log_group.ecs_backend.name
-  filter_pattern  = ""
-  destination_arn = aws_lambda_function.logs_to_opensearch.arn
-  depends_on      = [aws_lambda_permission.ecs_backend_allow_cloudwatch]
-}
-
-resource "aws_lambda_permission" "ecs_backend_allow_cloudwatch" {
-  statement_id  = "AllowExecutionFromCloudWatchECSBackend"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.logs_to_opensearch.function_name
-  principal     = "logs.amazonaws.com"
-  source_arn    = "${aws_cloudwatch_log_group.ecs_backend.arn}:*"
-}
-
-# ALB Public 로그 구독
-resource "aws_cloudwatch_log_subscription_filter" "alb_public_to_opensearch" {
-  name            = "alb-public-to-opensearch"
-  log_group_name  = aws_cloudwatch_log_group.alb_public.name
-  filter_pattern  = ""
-  destination_arn = aws_lambda_function.logs_to_opensearch.arn
-  depends_on      = [aws_lambda_permission.alb_public_allow_cloudwatch]
-}
-
-resource "aws_lambda_permission" "alb_public_allow_cloudwatch" {
-  statement_id  = "AllowExecutionFromCloudWatchALBPublic"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.logs_to_opensearch.function_name
-  principal     = "logs.amazonaws.com"
-  source_arn    = "${aws_cloudwatch_log_group.alb_public.arn}:*"
-}
-
-# ALB Internal 로그 구독
-resource "aws_cloudwatch_log_subscription_filter" "alb_internal_to_opensearch" {
-  name            = "alb-internal-to-opensearch"
-  log_group_name  = aws_cloudwatch_log_group.alb_internal.name
-  filter_pattern  = ""
-  destination_arn = aws_lambda_function.logs_to_opensearch.arn
-  depends_on      = [aws_lambda_permission.alb_internal_allow_cloudwatch]
-}
-
-resource "aws_lambda_permission" "alb_internal_allow_cloudwatch" {
-  statement_id  = "AllowExecutionFromCloudWatchALBInternal"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.logs_to_opensearch.function_name
-  principal     = "logs.amazonaws.com"
-  source_arn    = "${aws_cloudwatch_log_group.alb_internal.arn}:*"
-}
-
-# VPC Flow Logs 구독
-resource "aws_cloudwatch_log_subscription_filter" "vpc_flowlogs_to_opensearch" {
-  name            = "vpc-flowlogs-to-opensearch"
-  log_group_name  = aws_cloudwatch_log_group.vpc_flow_logs.name
-  filter_pattern  = ""
-  destination_arn = aws_lambda_function.logs_to_opensearch.arn
-  depends_on      = [aws_lambda_permission.vpc_flowlogs_allow_cloudwatch]
-}
-
-resource "aws_lambda_permission" "vpc_flowlogs_allow_cloudwatch" {
-  statement_id  = "AllowExecutionFromCloudWatchVPCFlowLogs"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.logs_to_opensearch.function_name
-  principal     = "logs.amazonaws.com"
-  source_arn    = "${aws_cloudwatch_log_group.vpc_flow_logs.arn}:*"
-}
-
-# CloudTrail 로그 구독
-resource "aws_cloudwatch_log_subscription_filter" "cloudtrail_to_opensearch" {
-  name            = "cloudtrail-to-opensearch"
-  log_group_name  = aws_cloudwatch_log_group.cloudtrail.name
-  filter_pattern  = ""
-  destination_arn = aws_lambda_function.logs_to_opensearch.arn
-  depends_on      = [aws_lambda_permission.cloudtrail_allow_cloudwatch]
-}
-
-resource "aws_lambda_permission" "cloudtrail_allow_cloudwatch" {
-  statement_id  = "AllowExecutionFromCloudWatchCloudTrail"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.logs_to_opensearch.function_name
-  principal     = "logs.amazonaws.com"
-  source_arn    = "${aws_cloudwatch_log_group.cloudtrail.arn}:*"
-}
-
-# Infrastructure Syslog 구독
-resource "aws_cloudwatch_log_subscription_filter" "infrastructure_to_opensearch" {
-  name            = "infrastructure-to-opensearch"
-  log_group_name  = aws_cloudwatch_log_group.infrastructure.name
-  filter_pattern  = ""
-  destination_arn = aws_lambda_function.logs_to_opensearch.arn
-  depends_on      = [aws_lambda_permission.infrastructure_allow_cloudwatch]
-}
-
-resource "aws_lambda_permission" "infrastructure_allow_cloudwatch" {
-  statement_id  = "AllowExecutionFromCloudWatchInfrastructure"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.logs_to_opensearch.function_name
-  principal     = "logs.amazonaws.com"
-  source_arn    = "${aws_cloudwatch_log_group.infrastructure.arn}:*"
-}
-
-# ========================================
-# 7. Data Sources
-# ========================================
-
-data "aws_caller_identity" "current" {}
-
-# ========================================
-# 8. Outputs
-# ========================================
-
-output "opensearch_endpoint" {
-  description = "OpenSearch domain endpoint"
-  value       = aws_opensearch_domain.logs.endpoint
-}
-
-output "opensearch_dashboard_endpoint" {
-  description = "OpenSearch Dashboards endpoint"
-  value       = aws_opensearch_domain.logs.dashboard_endpoint
-}
-
-output "cloudwatch_log_groups" {
-  description = "All CloudWatch Log Groups"
-  value = {
-    ecs_frontend   = aws_cloudwatch_log_group.ecs_frontend.name
-    ecs_backend    = aws_cloudwatch_log_group.ecs_backend.name
-    alb_public     = aws_cloudwatch_log_group.alb_public.name
-    alb_internal   = aws_cloudwatch_log_group.alb_internal.name
-    aurora_error   = aws_cloudwatch_log_group.aurora_error.name
-    aurora_slowquery = aws_cloudwatch_log_group.aurora_slowquery.name
-    vpc_flowlogs   = aws_cloudwatch_log_group.vpc_flow_logs.name
-    cloudtrail     = aws_cloudwatch_log_group.cloudtrail.name
-    infrastructure = aws_cloudwatch_log_group.infrastructure.name
+  tags = {
+    Name    = "Application-Logs-Firehose"
+    LogType = "application"
   }
 }
 
 # ========================================
-# Bastion Host (OpenSearch 접근용)
+# 6. Kinesis Firehose - Infrastructure Logs
 # ========================================
 
-# Bastion Host Security Group
+resource "aws_iam_role" "firehose_infrastructure" {
+  name = "${var.project_name}-firehose-infrastructure-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "firehose.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+
+  tags = {
+    Name = "Firehose-Infrastructure-Role"
+  }
+}
+
+resource "aws_iam_role_policy" "firehose_infrastructure" {
+  name = "${var.project_name}-firehose-infrastructure-policy"
+  role = aws_iam_role.firehose_infrastructure.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "es:DescribeElasticsearchDomain",
+          "es:DescribeElasticsearchDomains",
+          "es:DescribeElasticsearchDomainConfig",
+          "es:ESHttpHead",
+          "es:ESHttpPost",
+          "es:ESHttpPut",
+          "es:ESHttpGet"
+        ]
+        Resource = [
+          "${aws_opensearch_domain.logs.arn}",
+          "${aws_opensearch_domain.logs.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:AbortMultipartUpload",
+          "s3:GetBucketLocation",
+          "s3:GetObject",
+          "s3:ListBucket",
+          "s3:ListBucketMultipartUploads",
+          "s3:PutObject"
+        ]
+        Resource = [
+          "${aws_s3_bucket.logs_backup.arn}",
+          "${aws_s3_bucket.logs_backup.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/kinesisfirehose/*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeVpcs",
+          "ec2:DescribeVpcAttribute",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:CreateNetworkInterface",
+          "ec2:CreateNetworkInterfacePermission",
+          "ec2:DeleteNetworkInterface"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:InvokeFunction",
+          "lambda:GetFunctionConfiguration"
+        ]
+        Resource = "${aws_lambda_function.firehose_transform.arn}:*"
+      }
+    ]
+  })
+}
+
+resource "aws_kinesis_firehose_delivery_stream" "infrastructure_logs" {
+  name        = "${var.project_name}-infrastructure-logs"
+  destination = "opensearch"
+
+  opensearch_configuration {
+    domain_arn = aws_opensearch_domain.logs.arn
+    role_arn   = aws_iam_role.firehose_infrastructure.arn
+    index_name = "infra-logs"
+    
+    index_rotation_period = "OneDay"
+    
+    buffering_interval = 300
+    buffering_size     = 5
+    
+    retry_duration = 300
+    
+    s3_backup_mode = "AllDocuments"
+    
+    s3_configuration {
+      role_arn           = aws_iam_role.firehose_infrastructure.arn
+      bucket_arn         = aws_s3_bucket.logs_backup.arn
+      prefix             = "infrastructure-logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+      error_output_prefix = "infrastructure-logs-errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+      compression_format = "GZIP"
+    }
+    
+    vpc_config {
+      subnet_ids = [
+        aws_subnet.vpc1_ecs_backend_aza.id,
+        aws_subnet.vpc1_ecs_backend_azc.id
+      ]
+      security_group_ids = [aws_security_group.firehose.id]
+      role_arn           = aws_iam_role.firehose_infrastructure.arn
+    }
+    
+    processing_configuration {
+      enabled = true
+
+      processors {
+        type = "Lambda"
+
+        parameters {
+          parameter_name  = "LambdaArn"
+          parameter_value = "${aws_lambda_function.firehose_transform.arn}:$LATEST"
+        }
+        
+        parameters {
+          parameter_name  = "BufferSizeInMBs"
+          parameter_value = "1"
+        }
+        
+        parameters {
+          parameter_name  = "BufferIntervalInSeconds"
+          parameter_value = "60"
+        }
+      }
+    }
+    
+    cloudwatch_logging_options {
+      enabled         = true
+      log_group_name  = aws_cloudwatch_log_group.firehose_infrastructure.name
+      log_stream_name = "opensearch-delivery"
+    }
+  }
+  
+  depends_on = [
+    aws_iam_role_policy.firehose_infrastructure,
+    aws_cloudwatch_log_group.firehose_infrastructure,
+    aws_lambda_function.firehose_transform
+  ]
+
+  tags = {
+    Name    = "Infrastructure-Logs-Firehose"
+    LogType = "infrastructure"
+  }
+}
+
+# ========================================
+# 7. Kinesis Firehose - Audit Logs
+# ========================================
+
+resource "aws_iam_role" "firehose_audit" {
+  name = "${var.project_name}-firehose-audit-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "firehose.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+
+  tags = {
+    Name = "Firehose-Audit-Role"
+  }
+}
+
+resource "aws_iam_role_policy" "firehose_audit" {
+  name = "${var.project_name}-firehose-audit-policy"
+  role = aws_iam_role.firehose_audit.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "es:DescribeElasticsearchDomain",
+          "es:DescribeElasticsearchDomains",
+          "es:DescribeElasticsearchDomainConfig",
+          "es:ESHttpHead",
+          "es:ESHttpPost",
+          "es:ESHttpPut",
+          "es:ESHttpGet"
+        ]
+        Resource = [
+          "${aws_opensearch_domain.logs.arn}",
+          "${aws_opensearch_domain.logs.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:AbortMultipartUpload",
+          "s3:GetBucketLocation",
+          "s3:GetObject",
+          "s3:ListBucket",
+          "s3:ListBucketMultipartUploads",
+          "s3:PutObject"
+        ]
+        Resource = [
+          "${aws_s3_bucket.logs_backup.arn}",
+          "${aws_s3_bucket.logs_backup.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/kinesisfirehose/*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeVpcs",
+          "ec2:DescribeVpcAttribute",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:CreateNetworkInterface",
+          "ec2:CreateNetworkInterfacePermission",
+          "ec2:DeleteNetworkInterface"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:InvokeFunction",
+          "lambda:GetFunctionConfiguration"
+        ]
+        Resource = "${aws_lambda_function.firehose_transform.arn}:*"
+      }
+    ]
+  })
+}
+
+resource "aws_kinesis_firehose_delivery_stream" "audit_logs" {
+  name        = "${var.project_name}-audit-logs"
+  destination = "opensearch"
+
+  opensearch_configuration {
+    domain_arn = aws_opensearch_domain.logs.arn
+    role_arn   = aws_iam_role.firehose_audit.arn
+    index_name = "audit-logs"
+    
+    index_rotation_period = "OneDay"
+    
+    buffering_interval = 60
+    buffering_size     = 5
+    
+    retry_duration = 300
+    
+    s3_backup_mode = "AllDocuments"
+    
+    s3_configuration {
+      role_arn           = aws_iam_role.firehose_audit.arn
+      bucket_arn         = aws_s3_bucket.logs_backup.arn
+      prefix             = "audit-logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+      error_output_prefix = "audit-logs-errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+      compression_format = "GZIP"
+    }
+    
+    vpc_config {
+      subnet_ids = [
+        aws_subnet.vpc1_ecs_backend_aza.id,
+        aws_subnet.vpc1_ecs_backend_azc.id
+      ]
+      security_group_ids = [aws_security_group.firehose.id]
+      role_arn           = aws_iam_role.firehose_audit.arn
+    }
+    
+    processing_configuration {
+      enabled = true
+
+      processors {
+        type = "Lambda"
+
+        parameters {
+          parameter_name  = "LambdaArn"
+          parameter_value = "${aws_lambda_function.firehose_transform.arn}:$LATEST"
+        }
+        
+        parameters {
+          parameter_name  = "BufferSizeInMBs"
+          parameter_value = "1"
+        }
+        
+        parameters {
+          parameter_name  = "BufferIntervalInSeconds"
+          parameter_value = "60"
+        }
+      }
+    }
+    
+    cloudwatch_logging_options {
+      enabled         = true
+      log_group_name  = aws_cloudwatch_log_group.firehose_audit.name
+      log_stream_name = "opensearch-delivery"
+    }
+  }
+  
+  depends_on = [
+    aws_iam_role_policy.firehose_audit,
+    aws_cloudwatch_log_group.firehose_audit,
+    aws_lambda_function.firehose_transform
+  ]
+
+  tags = {
+    Name    = "Audit-Logs-Firehose"
+    LogType = "audit"
+  }
+}
+
+# ========================================
+# 8. Kinesis Firehose - Access Logs (ALB)
+# ========================================
+
+resource "aws_iam_role" "firehose_access" {
+  name = "${var.project_name}-firehose-access-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "firehose.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+
+  tags = {
+    Name = "Firehose-Access-Role"
+  }
+}
+
+resource "aws_iam_role_policy" "firehose_access" {
+  name = "${var.project_name}-firehose-access-policy"
+  role = aws_iam_role.firehose_access.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "es:DescribeElasticsearchDomain",
+          "es:DescribeElasticsearchDomains",
+          "es:DescribeElasticsearchDomainConfig",
+          "es:ESHttpHead",
+          "es:ESHttpPost",
+          "es:ESHttpPut",
+          "es:ESHttpGet"
+        ]
+        Resource = [
+          "${aws_opensearch_domain.logs.arn}",
+          "${aws_opensearch_domain.logs.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:AbortMultipartUpload",
+          "s3:GetBucketLocation",
+          "s3:GetObject",
+          "s3:ListBucket",
+          "s3:ListBucketMultipartUploads",
+          "s3:PutObject"
+        ]
+        Resource = [
+          "${aws_s3_bucket.alb_logs.arn}",
+          "${aws_s3_bucket.alb_logs.arn}/*",
+          "${aws_s3_bucket.logs_backup.arn}",
+          "${aws_s3_bucket.logs_backup.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/kinesisfirehose/*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:DescribeVpcs",
+          "ec2:DescribeVpcAttribute",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:CreateNetworkInterface",
+          "ec2:CreateNetworkInterfacePermission",
+          "ec2:DeleteNetworkInterface"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:InvokeFunction",
+          "lambda:GetFunctionConfiguration"
+        ]
+        Resource = "${aws_lambda_function.firehose_transform.arn}:*"
+      }
+    ]
+  })
+}
+
+resource "aws_kinesis_firehose_delivery_stream" "access_logs" {
+  name        = "${var.project_name}-access-logs"
+  destination = "opensearch"
+
+  opensearch_configuration {
+    domain_arn = aws_opensearch_domain.logs.arn
+    role_arn   = aws_iam_role.firehose_access.arn
+    index_name = "access-logs"
+    
+    index_rotation_period = "OneDay"
+    
+    buffering_interval = 60
+    buffering_size     = 5
+    
+    retry_duration = 300
+    
+    s3_backup_mode = "AllDocuments"
+    
+    s3_configuration {
+      role_arn           = aws_iam_role.firehose_access.arn
+      bucket_arn         = aws_s3_bucket.logs_backup.arn
+      prefix             = "access-logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+      error_output_prefix = "access-logs-errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+      compression_format = "GZIP"
+    }
+    
+    vpc_config {
+      subnet_ids = [
+        aws_subnet.vpc1_ecs_backend_aza.id,
+        aws_subnet.vpc1_ecs_backend_azc.id
+      ]
+      security_group_ids = [aws_security_group.firehose.id]
+      role_arn           = aws_iam_role.firehose_access.arn
+    }
+    
+    processing_configuration {
+      enabled = true
+
+      processors {
+        type = "Lambda"
+
+        parameters {
+          parameter_name  = "LambdaArn"
+          parameter_value = "${aws_lambda_function.firehose_transform.arn}:$LATEST"
+        }
+        
+        parameters {
+          parameter_name  = "BufferSizeInMBs"
+          parameter_value = "1"
+        }
+        
+        parameters {
+          parameter_name  = "BufferIntervalInSeconds"
+          parameter_value = "60"
+        }
+      }
+    }
+    
+    cloudwatch_logging_options {
+      enabled         = true
+      log_group_name  = aws_cloudwatch_log_group.firehose_access.name
+      log_stream_name = "opensearch-delivery"
+    }
+  }
+  
+  depends_on = [
+    aws_iam_role_policy.firehose_access,
+    aws_s3_bucket_policy.alb_logs,
+    aws_cloudwatch_log_group.firehose_access,
+    aws_lambda_function.firehose_transform
+  ]
+
+  tags = {
+    Name    = "Access-Logs-Firehose"
+    LogType = "access"
+  }
+}
+
+# ========================================
+# 9. CloudWatch Logs Subscription Filters
+# ========================================
+
+# Application Logs Subscriptions
+resource "aws_cloudwatch_log_subscription_filter" "ecs_frontend_to_firehose" {
+  name            = "ecs-frontend-to-firehose"
+  log_group_name  = aws_cloudwatch_log_group.ecs_frontend.name
+  filter_pattern  = ""
+  destination_arn = aws_kinesis_firehose_delivery_stream.application_logs.arn
+  role_arn        = aws_iam_role.cloudwatch_to_firehose.arn
+}
+
+resource "aws_cloudwatch_log_subscription_filter" "ecs_backend_to_firehose" {
+  name            = "ecs-backend-to-firehose"
+  log_group_name  = aws_cloudwatch_log_group.ecs_backend.name
+  filter_pattern  = ""
+  destination_arn = aws_kinesis_firehose_delivery_stream.application_logs.arn
+  role_arn        = aws_iam_role.cloudwatch_to_firehose.arn
+}
+
+resource "aws_cloudwatch_log_subscription_filter" "aurora_error_to_firehose" {
+  name            = "aurora-error-to-firehose"
+  log_group_name  = aws_cloudwatch_log_group.aurora_error.name
+  filter_pattern  = ""
+  destination_arn = aws_kinesis_firehose_delivery_stream.application_logs.arn
+  role_arn        = aws_iam_role.cloudwatch_to_firehose.arn
+}
+
+resource "aws_cloudwatch_log_subscription_filter" "aurora_slowquery_to_firehose" {
+  name            = "aurora-slowquery-to-firehose"
+  log_group_name  = aws_cloudwatch_log_group.aurora_slowquery.name
+  filter_pattern  = ""
+  destination_arn = aws_kinesis_firehose_delivery_stream.application_logs.arn
+  role_arn        = aws_iam_role.cloudwatch_to_firehose.arn
+}
+
+# Infrastructure Logs Subscription
+resource "aws_cloudwatch_log_subscription_filter" "vpc_flowlogs_to_firehose" {
+  name            = "vpc-flowlogs-to-firehose"
+  log_group_name  = aws_cloudwatch_log_group.vpc_flow_logs.name
+  filter_pattern  = ""
+  destination_arn = aws_kinesis_firehose_delivery_stream.infrastructure_logs.arn
+  role_arn        = aws_iam_role.cloudwatch_to_firehose.arn
+}
+
+# Audit Logs Subscription
+resource "aws_cloudwatch_log_subscription_filter" "cloudtrail_to_firehose" {
+  name            = "cloudtrail-to-firehose"
+  log_group_name  = aws_cloudwatch_log_group.cloudtrail.name
+  filter_pattern  = ""
+  destination_arn = aws_kinesis_firehose_delivery_stream.audit_logs.arn
+  role_arn        = aws_iam_role.cloudwatch_to_firehose.arn
+}
+
+# IAM Role for CloudWatch Logs → Firehose
+resource "aws_iam_role" "cloudwatch_to_firehose" {
+  name = "${var.project_name}-cloudwatch-to-firehose-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "logs.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+
+  tags = {
+    Name = "CloudWatch-to-Firehose-Role"
+  }
+}
+
+resource "aws_iam_role_policy" "cloudwatch_to_firehose" {
+  name = "${var.project_name}-cloudwatch-to-firehose-policy"
+  role = aws_iam_role.cloudwatch_to_firehose.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "firehose:PutRecord",
+          "firehose:PutRecordBatch"
+        ]
+        Resource = [
+          aws_kinesis_firehose_delivery_stream.application_logs.arn,
+          aws_kinesis_firehose_delivery_stream.infrastructure_logs.arn,
+          aws_kinesis_firehose_delivery_stream.audit_logs.arn,
+          aws_kinesis_firehose_delivery_stream.access_logs.arn
+        ]
+      }
+    ]
+  })
+}
+
+# ========================================
+# 10. Slack 알람 시스템
+# ========================================
+
+# Slack Webhook URL 변수 (main.tf에서 정의 필요)
+variable "slack_webhook_url" {
+  description = "Slack Incoming Webhook URL for alerts"
+  type        = string
+  default     = ""  # terraform.tfvars에서 설정하거나 apply 시 입력
+  sensitive   = true
+}
+
+# SNS Topic for Slack Alerts
+resource "aws_sns_topic" "slack_alerts" {
+  name = "${var.project_name}-slack-alerts"
+
+  tags = {
+    Name        = "Slack-Alerts-Topic"
+    Environment = var.environment
+  }
+}
+
+# CloudWatch Metric Filter - Backend ERROR 로그 감지
+resource "aws_cloudwatch_log_metric_filter" "backend_error_logs" {
+  name           = "${var.project_name}-backend-error-filter"
+  pattern        = "?ERROR ?Error ?error ?CRITICAL ?Critical ?FATAL ?Fatal ?Exception ?exception"
+  log_group_name = aws_cloudwatch_log_group.ecs_backend.name
+
+  metric_transformation {
+    name          = "BackendErrorCount"
+    namespace     = "${var.project_name}/ApplicationLogs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+# CloudWatch Metric Filter - Frontend ERROR 로그 감지
+resource "aws_cloudwatch_log_metric_filter" "frontend_error_logs" {
+  name           = "${var.project_name}-frontend-error-filter"
+  pattern        = "?ERROR ?Error ?error ?CRITICAL ?Critical ?FATAL ?Fatal ?Exception ?exception"
+  log_group_name = aws_cloudwatch_log_group.ecs_frontend.name
+
+  metric_transformation {
+    name          = "FrontendErrorCount"
+    namespace     = "${var.project_name}/ApplicationLogs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+# CloudWatch Alarm - Backend 에러
+resource "aws_cloudwatch_metric_alarm" "backend_error_alarm" {
+  alarm_name          = "${var.project_name}-backend-error-alarm"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "BackendErrorCount"
+  namespace           = "${var.project_name}/ApplicationLogs"
+  period              = 300  # 5분
+  statistic           = "Sum"
+  threshold           = 5    # 5분간 5개 이상 에러 시 알람
+  alarm_description   = "Backend 애플리케이션에서 에러 로그가 감지되었습니다."
+  
+  alarm_actions = [aws_sns_topic.slack_alerts.arn]
+  ok_actions    = [aws_sns_topic.slack_alerts.arn]
+  
+  treat_missing_data = "notBreaching"
+
+  tags = {
+    Name        = "Backend-Error-Alarm"
+    Environment = var.environment
+  }
+}
+
+# CloudWatch Alarm - Frontend 에러
+resource "aws_cloudwatch_metric_alarm" "frontend_error_alarm" {
+  alarm_name          = "${var.project_name}-frontend-error-alarm"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "FrontendErrorCount"
+  namespace           = "${var.project_name}/ApplicationLogs"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 10   # Frontend는 임계값 높게
+  alarm_description   = "Frontend 애플리케이션에서 에러 로그가 감지되었습니다."
+  
+  alarm_actions = [aws_sns_topic.slack_alerts.arn]
+  ok_actions    = [aws_sns_topic.slack_alerts.arn]
+  
+  treat_missing_data = "notBreaching"
+
+  tags = {
+    Name        = "Frontend-Error-Alarm"
+    Environment = var.environment
+  }
+}
+
+# Slack 알림 Lambda 로그 그룹
+resource "aws_cloudwatch_log_group" "slack_notifier_lambda" {
+  name              = "/aws/lambda/${var.project_name}-slack-notifier"
+  retention_in_days = 7
+
+  tags = {
+    Name        = "Slack-Notifier-Lambda-Logs"
+    Environment = var.environment
+  }
+}
+
+# Slack Lambda IAM Role
+resource "aws_iam_role" "slack_notifier_lambda" {
+  name = "${var.project_name}-slack-notifier-lambda-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+
+  tags = {
+    Name = "Slack-Notifier-Lambda-Role"
+  }
+}
+
+resource "aws_iam_role_policy" "slack_notifier_lambda" {
+  name = "${var.project_name}-slack-notifier-lambda-policy"
+  role = aws_iam_role.slack_notifier_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "${aws_cloudwatch_log_group.slack_notifier_lambda.arn}:*"
+      }
+    ]
+  })
+}
+
+# Slack 알림 Lambda 함수 코드
+data "archive_file" "slack_notifier" {
+  type        = "zip"
+  output_path = "${path.module}/lambda/slack_notifier.zip"
+
+  source {
+    content  = <<-EOF
+import json
+import os
+import urllib.request
+import urllib.error
+from datetime import datetime
+
+def lambda_handler(event, context):
+    webhook_url = os.environ.get('SLACK_WEBHOOK_URL', '')
+    
+    if not webhook_url:
+        print("SLACK_WEBHOOK_URL is not set")
+        return {'statusCode': 400, 'body': 'Webhook URL not configured'}
+    
+    for record in event.get('Records', []):
+        try:
+            # SNS 메시지 파싱
+            sns_message = json.loads(record['Sns']['Message'])
+            
+            # 알람 정보 추출
+            alarm_name = sns_message.get('AlarmName', 'Unknown Alarm')
+            new_state = sns_message.get('NewStateValue', 'Unknown')
+            old_state = sns_message.get('OldStateValue', 'Unknown')
+            reason = sns_message.get('NewStateReason', 'No reason provided')
+            timestamp = sns_message.get('StateChangeTime', datetime.now().isoformat())
+            region = sns_message.get('Region', 'Unknown')
+            
+            # 상태에 따른 색상 및 이모지 설정
+            if new_state == 'ALARM':
+                color = '#FF0000'  # 빨간색
+                emoji = '🚨'
+                status_text = 'ALARM 발생'
+            elif new_state == 'OK':
+                color = '#00FF00'  # 초록색
+                emoji = '✅'
+                status_text = '정상 복구'
+            else:
+                color = '#FFFF00'  # 노란색
+                emoji = '⚠️'
+                status_text = 'INSUFFICIENT_DATA'
+            
+            # Slack 메시지 구성
+            slack_message = {
+                "attachments": [
+                    {
+                        "color": color,
+                        "title": f"{emoji} [{status_text}] {alarm_name}",
+                        "fields": [
+                            {
+                                "title": "상태 변경",
+                                "value": f"{old_state} → {new_state}",
+                                "short": True
+                            },
+                            {
+                                "title": "리전",
+                                "value": region,
+                                "short": True
+                            },
+                            {
+                                "title": "발생 시간",
+                                "value": timestamp,
+                                "short": True
+                            },
+                            {
+                                "title": "원인",
+                                "value": reason[:500] if len(reason) > 500 else reason,
+                                "short": False
+                            }
+                        ],
+                        "footer": "CloudPentagon Monitoring System",
+                        "footer_icon": "https://a.slack-edge.com/80588/img/services/amazon_cloudwatch_512.png"
+                    }
+                ]
+            }
+            
+            # Slack으로 전송
+            req = urllib.request.Request(
+                webhook_url,
+                data=json.dumps(slack_message).encode('utf-8'),
+                headers={'Content-Type': 'application/json'},
+                method='POST'
+            )
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                print(f"Slack notification sent successfully: {response.status}")
+                
+        except urllib.error.URLError as e:
+            print(f"Failed to send Slack notification: {e}")
+            raise e
+        except Exception as e:
+            print(f"Error processing record: {e}")
+            raise e
+    
+    return {'statusCode': 200, 'body': 'Notifications sent'}
+EOF
+    filename = "index.py"
+  }
+}
+
+resource "aws_lambda_function" "slack_notifier" {
+  filename         = data.archive_file.slack_notifier.output_path
+  function_name    = "${var.project_name}-slack-notifier"
+  role             = aws_iam_role.slack_notifier_lambda.arn
+  handler          = "index.lambda_handler"
+  runtime          = "python3.12"
+  timeout          = 30
+  memory_size      = 128
+  source_code_hash = data.archive_file.slack_notifier.output_base64sha256
+
+  environment {
+    variables = {
+      SLACK_WEBHOOK_URL = var.slack_webhook_url
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.slack_notifier_lambda]
+
+  tags = {
+    Name        = "Slack-Notifier-Lambda"
+    Environment = var.environment
+  }
+}
+
+# SNS → Lambda 연결
+resource "aws_sns_topic_subscription" "slack_lambda_subscription" {
+  topic_arn = aws_sns_topic.slack_alerts.arn
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.slack_notifier.arn
+}
+
+resource "aws_lambda_permission" "sns_invoke_slack_lambda" {
+  statement_id  = "AllowSNSInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.slack_notifier.function_name
+  principal     = "sns.amazonaws.com"
+  source_arn    = aws_sns_topic.slack_alerts.arn
+}
+
+# ========================================
+# 11. VPC Flow Logs & CloudTrail Configuration
+# ========================================
+
+resource "aws_iam_role" "vpc_flow_logs_role" {
+  name = "${var.project_name}-vpc-flow-logs-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "vpc-flow-logs.amazonaws.com"
+      }
+    }]
+  })
+
+  tags = {
+    Name = "VPC-FlowLogs-Role"
+  }
+}
+
+resource "aws_iam_role_policy" "vpc_flow_logs_policy" {
+  name = "${var.project_name}-vpc-flow-logs-policy"
+  role = aws_iam_role.vpc_flow_logs_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams"
+      ]
+      Effect   = "Allow"
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_flow_log" "vpc1_flow_log" {
+  vpc_id          = aws_vpc.vpc1.id
+  traffic_type    = "ALL"
+  iam_role_arn    = aws_iam_role.vpc_flow_logs_role.arn
+  log_destination = aws_cloudwatch_log_group.vpc_flow_logs.arn
+
+  tags = {
+    Name = "VPC1-FlowLogs"
+  }
+}
+
+resource "aws_iam_role" "cloudtrail_role" {
+  name = "${var.project_name}-cloudtrail-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "cloudtrail.amazonaws.com"
+      }
+    }]
+  })
+
+  tags = {
+    Name = "CloudTrail-Role"
+  }
+}
+
+resource "aws_iam_role_policy" "cloudtrail_policy" {
+  name = "${var.project_name}-cloudtrail-policy"
+  role = aws_iam_role.cloudtrail_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ]
+      Resource = "${aws_cloudwatch_log_group.cloudtrail.arn}:*"
+    }]
+  })
+}
+
+resource "aws_cloudtrail" "main" {
+  name                          = "${var.project_name}-trail"
+  s3_bucket_name                = aws_s3_bucket.cloudtrail.id
+  include_global_service_events = true
+  is_multi_region_trail         = false
+  enable_log_file_validation    = true
+
+  cloud_watch_logs_group_arn = "${aws_cloudwatch_log_group.cloudtrail.arn}:*"
+  cloud_watch_logs_role_arn  = aws_iam_role.cloudtrail_role.arn
+
+  event_selector {
+    read_write_type           = "All"
+    include_management_events = true
+  }
+
+  depends_on = [aws_s3_bucket_policy.cloudtrail]
+
+  tags = {
+    Name = "Main-CloudTrail"
+  }
+}
+
+# ========================================
+# 12. Bastion Host (OpenSearch 대시보드 접근용)
+# ========================================
+
 resource "aws_security_group" "bastion" {
   name        = "${var.project_name}-bastion-sg"
   description = "Security group for Bastion Host"
   vpc_id      = aws_vpc.vpc1.id
 
-  # SSH 접근
   ingress {
     description = "SSH from my IP"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["121.160.41.207/32"]  # ← https://ifconfig.me/
+    cidr_blocks = [
+      "121.160.41.207/32",
+      "222.112.195.117/32"
+    ]
   }
 
   egress {
@@ -740,7 +1820,6 @@ resource "aws_security_group" "bastion" {
   }
 }
 
-# OpenSearch 보안 그룹 수정 (Bastion에서 접근 허용)
 resource "aws_security_group_rule" "opensearch_from_bastion" {
   type                     = "ingress"
   from_port                = 443
@@ -751,13 +1830,12 @@ resource "aws_security_group_rule" "opensearch_from_bastion" {
   description              = "HTTPS from Bastion"
 }
 
-# Bastion Host EC2
 resource "aws_instance" "bastion" {
-  ami           = "ami-04fcc2023d6e37430"  # Amazon Linux 2023 (ap-northeast-2)
+  ami           = "ami-04fcc2023d6e37430"
   instance_type = "t3.micro"
-  key_name      = "soldesk-507"  # ← SSH 키 페어 이름
+  key_name      = "soldesk-507"
 
-  subnet_id                   = aws_subnet.vpc1_public_aza.id  # Public 서브넷
+  subnet_id                   = aws_subnet.vpc1_public_aza.id
   vpc_security_group_ids      = [aws_security_group.bastion.id]
   associate_public_ip_address = true
 
@@ -767,7 +1845,102 @@ resource "aws_instance" "bastion" {
   }
 }
 
+# ========================================
+# 13. Outputs
+# ========================================
+
+output "opensearch_endpoint" {
+  description = "OpenSearch domain endpoint"
+  value       = aws_opensearch_domain.logs.endpoint
+}
+
+output "opensearch_dashboard_url" {
+  description = "OpenSearch Dashboards URL"
+  value       = "https://${aws_opensearch_domain.logs.endpoint}/_dashboards"
+}
+
+output "firehose_streams" {
+  description = "Kinesis Firehose delivery streams"
+  value = {
+    application    = aws_kinesis_firehose_delivery_stream.application_logs.name
+    infrastructure = aws_kinesis_firehose_delivery_stream.infrastructure_logs.name
+    audit          = aws_kinesis_firehose_delivery_stream.audit_logs.name
+    access         = aws_kinesis_firehose_delivery_stream.access_logs.name
+  }
+}
+
+output "firehose_transform_lambda" {
+  description = "Firehose Transform Lambda function"
+  value       = aws_lambda_function.firehose_transform.function_name
+}
+
+output "slack_notifier_lambda" {
+  description = "Slack Notifier Lambda function"
+  value       = aws_lambda_function.slack_notifier.function_name
+}
+
+output "slack_alerts_topic" {
+  description = "SNS Topic for Slack alerts"
+  value       = aws_sns_topic.slack_alerts.arn
+}
+
+output "s3_backup_bucket" {
+  description = "S3 bucket for log backups"
+  value       = aws_s3_bucket.logs_backup.id
+}
+
+output "alb_logs_bucket" {
+  description = "S3 bucket for ALB access logs"
+  value       = aws_s3_bucket.alb_logs.id
+}
+
+output "aurora_log_groups" {
+  description = "Aurora CloudWatch Log Groups"
+  value = {
+    error     = aws_cloudwatch_log_group.aurora_error.name
+    slowquery = aws_cloudwatch_log_group.aurora_slowquery.name
+  }
+}
+
+output "firehose_roles" {
+  description = "Firehose IAM Role ARNs (for OpenSearch role mapping)"
+  value = {
+    application    = aws_iam_role.firehose_application.arn
+    infrastructure = aws_iam_role.firehose_infrastructure.arn
+    audit          = aws_iam_role.firehose_audit.arn
+    access         = aws_iam_role.firehose_access.arn
+  }
+}
+
 output "bastion_public_ip" {
-  description = "Bastion Host Public IP"
+  description = "Bastion Host Public IP (for OpenSearch Dashboard access)"
   value       = aws_instance.bastion.public_ip
+}
+
+output "opensearch_access_guide" {
+  description = "How to access OpenSearch Dashboard"
+  value       = <<-EOT
+    1. SSH to Bastion: ssh -i soldesk-507.pem ec2-user@${aws_instance.bastion.public_ip}
+    2. Port Forward: ssh -i soldesk-507.pem -N -L 9200:${aws_opensearch_domain.logs.endpoint}:443 ec2-user@${aws_instance.bastion.public_ip}
+    3. Access Dashboard: https://localhost:9200/_dashboards
+    4. Login: admin / Admin123!@#
+  EOT
+}
+
+output "slack_setup_guide" {
+  description = "How to set up Slack notifications"
+  value       = <<-EOT
+    1. Slack에서 Incoming Webhook 생성:
+       - Slack 워크스페이스 → Apps → Incoming Webhooks
+       - Add to Slack → 채널 선택 → Webhook URL 복사
+    
+    2. terraform.tfvars에 추가:
+       slack_webhook_url = "https://hooks.slack.com/services/xxx/yyy/zzz"
+    
+    3. terraform apply 실행
+    
+    4. 테스트:
+       aws sns publish --topic-arn ${aws_sns_topic.slack_alerts.arn} \
+         --message '{"AlarmName":"Test","NewStateValue":"ALARM","OldStateValue":"OK","NewStateReason":"Test message","Region":"ap-northeast-2"}'
+  EOT
 }
