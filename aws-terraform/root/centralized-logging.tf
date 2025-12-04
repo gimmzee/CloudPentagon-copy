@@ -139,6 +139,18 @@ resource "aws_cloudwatch_log_group" "firehose_access" {
   }
 }
 
+# ALB Access Logs
+resource "aws_cloudwatch_log_group" "alb_access" {
+  name              = "/aws/alb/${var.project_name}/access"
+  retention_in_days = 7
+
+  tags = {
+    Name        = "ALB-Access-Logs"
+    Environment = var.environment
+    LogType     = "access"
+  }
+}
+
 # ========================================
 # 2. S3 Buckets for Backup & Source
 # ========================================
@@ -1243,26 +1255,27 @@ resource "aws_kinesis_firehose_delivery_stream" "access_logs" {
     }
     
     processing_configuration {
-      enabled = true
+      enabled = false
+      # enabled = true
 
-      processors {
-        type = "Lambda"
+      # processors {
+      #   type = "Lambda"
 
-        parameters {
-          parameter_name  = "LambdaArn"
-          parameter_value = "${aws_lambda_function.firehose_transform.arn}:$LATEST"
-        }
+      #   parameters {
+      #     parameter_name  = "LambdaArn"
+      #     parameter_value = "${aws_lambda_function.firehose_transform.arn}:$LATEST"
+      #   }
         
-        parameters {
-          parameter_name  = "BufferSizeInMBs"
-          parameter_value = "1"
-        }
+      #   parameters {
+      #     parameter_name  = "BufferSizeInMBs"
+      #     parameter_value = "1"
+      #   }
         
-        parameters {
-          parameter_name  = "BufferIntervalInSeconds"
-          parameter_value = "60"
-        }
-      }
+      #   parameters {
+      #     parameter_name  = "BufferIntervalInSeconds"
+      #     parameter_value = "60"
+      #   }
+      # }
     }
     
     cloudwatch_logging_options {
@@ -1283,6 +1296,137 @@ resource "aws_kinesis_firehose_delivery_stream" "access_logs" {
     Name    = "Access-Logs-Firehose"
     LogType = "access"
   }
+}
+
+# ========================================
+# 8.5 ALB Access Logs → Firehose 연결 (Lambda)
+# ========================================
+#
+# ALB는 S3에만 로그를 쓸 수 있으므로 Lambda로 연결 필요
+# 흐름: ALB → S3 → Lambda (S3 Event) → Firehose → OpenSearch
+# ========================================
+
+# Lambda 함수 코드 패키징
+data "archive_file" "alb_s3_to_firehose" {
+  type        = "zip"
+  source_file = "${path.module}/lambda/alb-s3-to-firehose.py"
+  output_path = "${path.module}/lambda/alb-s3-to-firehose.zip"
+}
+
+# Lambda IAM Role
+resource "aws_iam_role" "alb_s3_to_firehose_lambda" {
+  name = "${var.project_name}-alb-s3-to-firehose-lambda"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+
+  tags = {
+    Name = "ALB-S3-Firehose-Lambda-Role"
+  }
+}
+
+# Lambda IAM Policy
+resource "aws_iam_role_policy" "alb_s3_to_firehose_lambda" {
+  name = "${var.project_name}-alb-s3-to-firehose-lambda-policy"
+  role = aws_iam_role.alb_s3_to_firehose_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:*:*:*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.alb_logs.arn,
+          "${aws_s3_bucket.alb_logs.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "firehose:PutRecord",
+          "firehose:PutRecordBatch"
+        ]
+        Resource = aws_kinesis_firehose_delivery_stream.access_logs.arn
+      }
+    ]
+  })
+}
+
+# Lambda 함수
+resource "aws_lambda_function" "alb_s3_to_firehose" {
+  filename      = data.archive_file.alb_s3_to_firehose.output_path
+  function_name = "${var.project_name}-alb-s3-to-firehose"
+  role          = aws_iam_role.alb_s3_to_firehose_lambda.arn
+  handler       = "alb-s3-to-firehose.handler"
+  runtime       = "python3.11"
+  timeout       = 300  # 5분 (ALB 로그 파일이 클 수 있음)
+  memory_size   = 512
+
+  source_code_hash = data.archive_file.alb_s3_to_firehose.output_base64sha256
+
+  environment {
+    variables = {
+      FIREHOSE_STREAM_NAME = aws_kinesis_firehose_delivery_stream.access_logs.name
+    }
+  }
+
+  tags = {
+    Name = "ALB-S3-Firehose-Lambda"
+  }
+}
+
+# Lambda CloudWatch Log Group
+resource "aws_cloudwatch_log_group" "alb_s3_to_firehose_lambda" {
+  name              = "/aws/lambda/${aws_lambda_function.alb_s3_to_firehose.function_name}"
+  retention_in_days = 7
+
+  tags = {
+    Name = "ALB-S3-Firehose-Lambda-Logs"
+  }
+}
+
+# S3 → Lambda 권한
+resource "aws_lambda_permission" "allow_s3_alb_logs" {
+  statement_id  = "AllowS3Invoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.alb_s3_to_firehose.function_name
+  principal     = "s3.amazonaws.com"
+  source_arn    = aws_s3_bucket.alb_logs.arn
+}
+
+# S3 버킷 이벤트 알림
+resource "aws_s3_bucket_notification" "alb_logs" {
+  bucket = aws_s3_bucket.alb_logs.id
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.alb_s3_to_firehose.arn
+    events              = ["s3:ObjectCreated:*"]
+    filter_prefix       = "alb-"  # alb-public/, alb-internal/
+    filter_suffix       = ".gz"
+  }
+
+  depends_on = [aws_lambda_permission.allow_s3_alb_logs]
 }
 
 # ========================================
@@ -1392,7 +1536,7 @@ resource "aws_iam_role_policy" "cloudwatch_to_firehose" {
 variable "slack_webhook_url" {
   description = "Slack Incoming Webhook URL for alerts"
   type        = string
-  default     = ""  # terraform.tfvars에서 설정하거나 apply 시 입력
+  default     = "https://hooks.slack.com/services/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"  # terraform.tfvars에서 설정하거나 apply 시 입력
   sensitive   = true
 }
 
@@ -1453,6 +1597,7 @@ resource "aws_cloudwatch_metric_alarm" "backend_error_alarm" {
 
   tags = {
     Name        = "Backend-Error-Alarm"
+    Category    = "Application"
     Environment = var.environment
   }
 }
@@ -1476,6 +1621,244 @@ resource "aws_cloudwatch_metric_alarm" "frontend_error_alarm" {
 
   tags = {
     Name        = "Frontend-Error-Alarm"
+    Category    = "Application"
+    Environment = var.environment
+  }
+}
+
+# ========================================
+# Infrastructure 로그 알람 (VPC Flow Logs)
+# ========================================
+
+# VPC Flow Logs - REJECT 트래픽 감지
+resource "aws_cloudwatch_log_metric_filter" "vpc_rejected_traffic" {
+  name           = "${var.project_name}-vpc-rejected-filter"
+  pattern        = "[version, account, eni, source, destination, srcport, destport, protocol, packets, bytes, windowstart, windowend, action=\"REJECT\", flowlogstatus]"
+  log_group_name = aws_cloudwatch_log_group.vpc_flow_logs.name
+
+  metric_transformation {
+    name          = "VPCRejectedPackets"
+    namespace     = "${var.project_name}/InfrastructureLogs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "vpc_rejected_alarm" {
+  alarm_name          = "${var.project_name}-vpc-rejected-alarm"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "VPCRejectedPackets"
+  namespace           = "${var.project_name}/InfrastructureLogs"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 100  # 5분간 100개 이상 거부된 패킷
+  alarm_description   = "VPC에서 비정상적으로 많은 트래픽이 거부되었습니다. 보안 위협 가능성이 있습니다."
+
+  alarm_actions = [aws_sns_topic.slack_alerts.arn]
+  ok_actions    = [aws_sns_topic.slack_alerts.arn]
+
+  treat_missing_data = "notBreaching"
+
+  tags = {
+    Name        = "VPC-Rejected-Traffic-Alarm"
+    Category    = "Infrastructure"
+    Environment = var.environment
+  }
+}
+
+# ========================================
+# Audit 로그 알람 (CloudTrail)
+# ========================================
+
+# CloudTrail - 보안 관련 이벤트 감지
+resource "aws_cloudwatch_log_metric_filter" "security_events" {
+  name           = "${var.project_name}-security-events-filter"
+  pattern        = "{ ($.eventName = \"ConsoleLogin\") || ($.eventName = \"StopInstances\") || ($.eventName = \"TerminateInstances\") || ($.eventName = \"DeleteBucket\") || ($.eventName = \"DeleteDBInstance\") || ($.eventName = \"AuthorizeSecurityGroupIngress\") || ($.eventName = \"CreateUser\") || ($.eventName = \"DeleteUser\") || ($.eventName = \"AttachRolePolicy\") }"
+  log_group_name = aws_cloudwatch_log_group.cloudtrail.name
+
+  metric_transformation {
+    name          = "SecurityEventCount"
+    namespace     = "${var.project_name}/AuditLogs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "security_events_alarm" {
+  alarm_name          = "${var.project_name}-security-events-alarm"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "SecurityEventCount"
+  namespace           = "${var.project_name}/AuditLogs"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 10  # 5분간 10개 이상 보안 이벤트
+  alarm_description   = "중요한 보안 이벤트가 다수 감지되었습니다. 즉시 확인이 필요합니다."
+
+  alarm_actions = [aws_sns_topic.slack_alerts.arn]
+  ok_actions    = [aws_sns_topic.slack_alerts.arn]
+
+  treat_missing_data = "notBreaching"
+
+  tags = {
+    Name        = "Security-Events-Alarm"
+    Category    = "Audit"
+    Environment = var.environment
+  }
+}
+
+# CloudTrail - 로그인 실패 감지
+resource "aws_cloudwatch_log_metric_filter" "failed_login" {
+  name           = "${var.project_name}-failed-login-filter"
+  pattern        = "{ ($.eventName = \"ConsoleLogin\") && ($.errorMessage = \"Failed authentication\") }"
+  log_group_name = aws_cloudwatch_log_group.cloudtrail.name
+
+  metric_transformation {
+    name          = "FailedLoginCount"
+    namespace     = "${var.project_name}/AuditLogs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "failed_login_alarm" {
+  alarm_name          = "${var.project_name}-failed-login-alarm"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "FailedLoginCount"
+  namespace           = "${var.project_name}/AuditLogs"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 3  # 5분간 3회 이상 로그인 실패
+  alarm_description   = "AWS 콘솔 로그인 실패가 반복되고 있습니다. 무차별 대입 공격 가능성이 있습니다."
+
+  alarm_actions = [aws_sns_topic.slack_alerts.arn]
+  ok_actions    = [aws_sns_topic.slack_alerts.arn]
+
+  treat_missing_data = "notBreaching"
+
+  tags = {
+    Name        = "Failed-Login-Alarm"
+    Category    = "Audit"
+    Environment = var.environment
+  }
+}
+
+# ========================================
+# Access 로그 알람 (ALB)
+# ========================================
+
+# ALB Access Logs - 5xx 에러 감지
+resource "aws_cloudwatch_log_metric_filter" "alb_5xx_errors" {
+  name           = "${var.project_name}-alb-5xx-filter"
+  pattern        = "[type, time, elb, client_ip, target_ip, request_processing_time, target_processing_time, response_processing_time, elb_status_code=5*, target_status_code, received_bytes, sent_bytes, ...]"
+  log_group_name = aws_cloudwatch_log_group.alb_access.name
+
+  metric_transformation {
+    name          = "ALB5xxErrorCount"
+    namespace     = "${var.project_name}/AccessLogs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "alb_5xx_alarm" {
+  alarm_name          = "${var.project_name}-alb-5xx-alarm"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ALB5xxErrorCount"
+  namespace           = "${var.project_name}/AccessLogs"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 10  # 5분간 10개 이상 5xx 에러
+  alarm_description   = "ALB에서 5xx 서버 에러가 다수 발생했습니다. 백엔드 서비스 상태를 확인하세요."
+
+  alarm_actions = [aws_sns_topic.slack_alerts.arn]
+  ok_actions    = [aws_sns_topic.slack_alerts.arn]
+
+  treat_missing_data = "notBreaching"
+
+  tags = {
+    Name        = "ALB-5xx-Error-Alarm"
+    Category    = "Access"
+    Environment = var.environment
+  }
+}
+
+# ALB Access Logs - 4xx 에러 감지 (선택적)
+resource "aws_cloudwatch_log_metric_filter" "alb_4xx_errors" {
+  name           = "${var.project_name}-alb-4xx-filter"
+  pattern        = "[type, time, elb, client_ip, target_ip, request_processing_time, target_processing_time, response_processing_time, elb_status_code=4*, target_status_code, received_bytes, sent_bytes, ...]"
+  log_group_name = aws_cloudwatch_log_group.alb_access.name
+
+  metric_transformation {
+    name          = "ALB4xxErrorCount"
+    namespace     = "${var.project_name}/AccessLogs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "alb_4xx_alarm" {
+  alarm_name          = "${var.project_name}-alb-4xx-alarm"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ALB4xxErrorCount"
+  namespace           = "${var.project_name}/AccessLogs"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 50  # 5분간 50개 이상 4xx 에러
+  alarm_description   = "ALB에서 4xx 클라이언트 에러가 다수 발생했습니다."
+
+  alarm_actions = [aws_sns_topic.slack_alerts.arn]
+  ok_actions    = [aws_sns_topic.slack_alerts.arn]
+
+  treat_missing_data = "notBreaching"
+
+  tags = {
+    Name        = "ALB-4xx-Error-Alarm"
+    Category    = "Access"
+    Environment = var.environment
+  }
+}
+
+# ========================================
+# RDS 슬로우 쿼리 알람
+# ========================================
+
+resource "aws_cloudwatch_log_metric_filter" "rds_slow_query" {
+  name           = "${var.project_name}-rds-slowquery-filter"
+  pattern        = "Query_time"
+  log_group_name = aws_cloudwatch_log_group.aurora_slowquery.name
+
+  metric_transformation {
+    name          = "RDSSlowQueryCount"
+    namespace     = "${var.project_name}/ApplicationLogs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "rds_slow_query_alarm" {
+  alarm_name          = "${var.project_name}-rds-slowquery-alarm"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "RDSSlowQueryCount"
+  namespace           = "${var.project_name}/ApplicationLogs"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 20  # 5분간 20개 이상 슬로우 쿼리
+  alarm_description   = "RDS에서 슬로우 쿼리가 다수 발생했습니다. 데이터베이스 성능을 확인하세요."
+
+  alarm_actions = [aws_sns_topic.slack_alerts.arn]
+  ok_actions    = [aws_sns_topic.slack_alerts.arn]
+
+  treat_missing_data = "notBreaching"
+
+  tags = {
+    Name        = "RDS-SlowQuery-Alarm"
+    Category    = "Application"
     Environment = var.environment
   }
 }
@@ -1942,5 +2325,23 @@ output "slack_setup_guide" {
     4. 테스트:
        aws sns publish --topic-arn ${aws_sns_topic.slack_alerts.arn} \
          --message '{"AlarmName":"Test","NewStateValue":"ALARM","OldStateValue":"OK","NewStateReason":"Test message","Region":"ap-northeast-2"}'
+  EOT
+}
+
+output "alb_s3_to_firehose_lambda" {
+  description = "ALB S3 to Firehose Lambda function name"
+  value       = aws_lambda_function.alb_s3_to_firehose.function_name
+}
+
+output "alb_logs_flow" {
+  description = "ALB Access Logs data flow"
+  value       = <<-EOT
+    ALB → S3 (${aws_s3_bucket.alb_logs.id})
+      ↓ (S3 Event)
+    Lambda (${aws_lambda_function.alb_s3_to_firehose.function_name})
+      ↓
+    Firehose (${aws_kinesis_firehose_delivery_stream.access_logs.name})
+      ↓
+    OpenSearch (access-logs-*)
   EOT
 }

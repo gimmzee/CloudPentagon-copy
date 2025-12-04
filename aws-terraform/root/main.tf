@@ -1253,7 +1253,7 @@ resource "aws_appautoscaling_policy" "backend_cpu" {
 # ========================================
 # AWS Secrets Manager
 resource "aws_secretsmanager_secret" "aws_db_secret" {
-  name        = "db-credentials-dev-v5"
+  name        = "db-credentials-dev-v6"
   description = "Credentials for Aurora MySQL"
 }
 
